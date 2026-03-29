@@ -85,26 +85,3 @@ def health():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
-```
-
-**requirements.txt — type this exactly:**
-```
-flask
-gunicorn
-yfinance
-pandas
-numpy
-scikit-learn
-xgboost
-joblib
-ta
-```
-
-**Procfile — type this exactly (one line only):**
-```
-web: gunicorn app:app
-```
-
-**runtime.txt — type this exactly (one line only):**
-```
-python-3.10.13
