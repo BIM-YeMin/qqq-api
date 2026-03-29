@@ -8,11 +8,23 @@ import ta
 import os
 
 app = Flask(__name__)
-model = joblib.load('xgb_model.pkl')
-scaler = joblib.load('scaler.pkl')
 
-with open('features.json') as f:
-    FEATURES = json.load(f)
+TICKERS = ['QQQ', 'NVDA', 'SPY', 'GLD', 'SLV']
+MODELS = {}
+
+for ticker in TICKERS:
+    model_path = f'{ticker}_model.pkl'
+    scaler_path = f'{ticker}_scaler.pkl'
+    feature_path = f'{ticker}_features.json'
+    if os.path.exists(model_path):
+        MODELS[ticker] = {
+            'model': joblib.load(model_path),
+            'scaler': joblib.load(scaler_path),
+            'features': json.load(open(feature_path))
+        }
+        print(f"Loaded model for {ticker}")
+    else:
+        print(f"No model found for {ticker}")
 
 def build_features(ticker):
     df = yf.download(ticker, period='6mo', auto_adjust=True, progress=False)
@@ -40,7 +52,9 @@ def build_features(ticker):
 
 @app.route('/signal')
 def signal():
-    ticker = request.args.get('ticker', 'QQQ')
+    ticker = request.args.get('ticker', 'QQQ').upper()
+    if ticker not in MODELS:
+        return jsonify({'status': 'error', 'error': f'No AI model for {ticker}'}), 404
     try:
         df = build_features(ticker)
         close = df['Close'].squeeze()
@@ -50,9 +64,10 @@ def signal():
         rsi_val = round(float(df['rsi'].iloc[-1]), 1)
         sma20 = round(float(df['sma_20'].iloc[-1]), 2)
         sma50 = round(float(df['sma_50'].iloc[-1]), 2)
-        latest = df[FEATURES].iloc[-1:]
-        scaled = scaler.transform(latest)
-        proba = float(model.predict_proba(scaled)[0][1])
+        m = MODELS[ticker]
+        latest = df[m['features']].iloc[-1:]
+        scaled = m['scaler'].transform(latest)
+        proba = float(m['model'].predict_proba(scaled)[0][1])
         if proba >= 0.55:
             sig = "BUY / HOLD"
             conf = round(proba * 100)
@@ -72,15 +87,53 @@ def signal():
             'rsi': rsi_val,
             'sma20': sma20,
             'sma50': sma50,
-            'model': 'XGBoost AI v1',
+            'model': f'XGBoost AI v1 ({ticker})',
             'status': 'ok'
         })
     except Exception as e:
         return jsonify({'status': 'error', 'error': str(e)}), 500
 
+@app.route('/signals/all')
+def all_signals():
+    results = {}
+    for ticker in MODELS.keys():
+        try:
+            df = build_features(ticker)
+            close = df['Close'].squeeze()
+            price = float(close.iloc[-1])
+            prev = float(close.iloc[-2])
+            m = MODELS[ticker]
+            latest = df[m['features']].iloc[-1:]
+            scaled = m['scaler'].transform(latest)
+            proba = float(m['model'].predict_proba(scaled)[0][1])
+            if proba >= 0.55:
+                sig = "BUY / HOLD"
+                conf = round(proba * 100)
+            elif proba <= 0.45:
+                sig = "SELL / STAY OUT"
+                conf = round((1 - proba) * 100)
+            else:
+                sig = "HOLD / NEUTRAL"
+                conf = 50
+            results[ticker] = {
+                'signal': sig,
+                'confidence': conf,
+                'probability': round(proba, 4),
+                'price': round(float(price), 2),
+                'rsi': round(float(df['rsi'].iloc[-1]), 1),
+                'status': 'ok'
+            }
+        except Exception as e:
+            results[ticker] = {'status': 'error', 'error': str(e)}
+    return jsonify(results)
+
 @app.route('/health')
 def health():
-    return jsonify({'status': 'running', 'model': 'XGBoost loaded'})
+    return jsonify({
+        'status': 'running',
+        'models': list(MODELS.keys()),
+        'count': len(MODELS)
+    })
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
