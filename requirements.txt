@@ -1,0 +1,9 @@
+flask
+gunicorn
+yfinance
+pandas
+numpy
+scikit-learn
+xgboost
+joblib
+ta
