@@ -337,23 +337,3 @@ def health():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
-```
-
-**Step 2 — Commit on GitHub:**
-```
-Scroll down → click "Commit changes"
-Railway will auto-redeploy in 3-5 minutes
-```
-
-**Step 3 — Wait for Railway to redeploy then test:**
-```
-https://your-url.railway.app/health
-
-Should show:
-{
-  "stock_models"  : ["QQQ","NVDA","SPY","GLD","SLV"],
-  "options_models": ["0DTE","1DTE","3DTE","7DTE"],
-  "stock_count"   : 5,
-  "options_count" : 4,
-  "status"        : "running"
-}
