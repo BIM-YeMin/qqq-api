@@ -1,0 +1,30 @@
+{
+  "0DTE": {
+    "vix_max": 25,
+    "threshold": 0.55,
+    "premium_pct": 0.35,
+    "stop_mult": 2.0,
+    "take_profit": 0.6
+  },
+  "1DTE": {
+    "vix_max": 25,
+    "threshold": 0.55,
+    "premium_pct": 0.35,
+    "stop_mult": 2.0,
+    "take_profit": 0.6
+  },
+  "3DTE": {
+    "vix_max": 30,
+    "threshold": 0.58,
+    "premium_pct": 0.35,
+    "stop_mult": 2.0,
+    "take_profit": 0.6
+  },
+  "7DTE": {
+    "vix_max": 25,
+    "threshold": 0.6,
+    "premium_pct": 0.4,
+    "stop_mult": 1.5,
+    "take_profit": 0.55
+  }
+}
