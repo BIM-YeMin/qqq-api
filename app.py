@@ -142,8 +142,20 @@ def build_options_features(vix_now, vix_prev5):
     spy['month']        = pd.to_datetime(
                            spy.index).month
 
-    spy.dropna(inplace=True)
+    # KEY FIX: only drop NaN in feature columns
+    # do NOT dropna on all columns
+    # this keeps the latest rows intact
+    feature_cols = [
+        'hv5','hv10','hv20','vix','vix_ma10',
+        'vix_ma20','iv_rank','iv_pct',
+        'vix_hv_ratio','vix_chg1','vix_chg5',
+        'sma20','sma50','rsi','returns1',
+        'returns5','dist_sma20','atr_pct',
+        'day_of_week','month'
+    ]
+    spy.dropna(subset=feature_cols, inplace=True)
     return spy
+
 
 # ── STOCK SIGNAL ENDPOINT ────────────────────────────────────
 @app.route('/signal')
