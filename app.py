@@ -39,7 +39,6 @@ for dte in OPTIONS_TICKERS:
         }
         print(f"Loaded options model: {dte}")
 
-# Load options config
 OPTIONS_FEATURES = []
 VIX_RULES = {}
 if os.path.exists('options_features.json'):
@@ -54,110 +53,110 @@ STRIKE_MULT = {
     '3DTE': 1.5, '7DTE': 2.0
 }
 
-# ── HELPER FUNCTIONS ─────────────────────────────────────────
+# ── STOCK FEATURES ───────────────────────────────────────────
 def build_stock_features(ticker):
-    df     = yf.Ticker(ticker).history(
-             period='6mo', auto_adjust=True)
+    df = yf.Ticker(ticker).history(
+         period='6mo', auto_adjust=True)
     df.index = pd.to_datetime(
                df.index).tz_localize(None)
     close  = df['Close']
     volume = df['Volume']
-    df['sma_20']      = close.rolling(20).mean()
-    df['sma_50']      = close.rolling(50).mean()
-    df['ema_12']      = close.ewm(span=12).mean()
-    df['rsi']         = ta.momentum.RSIIndicator(
-                         close).rsi()
-    df['macd']        = ta.trend.MACD(close).macd()
-    df['macd_sig']    = ta.trend.MACD(
-                         close).macd_signal()
-    df['bb_high']     = ta.volatility.BollingerBands(
-                         close).bollinger_hband()
-    df['bb_low']      = ta.volatility.BollingerBands(
-                         close).bollinger_lband()
-    df['volume_ma']   = volume.rolling(20).mean()
-    df['returns']     = close.pct_change()
-    df['mom_5']       = close.pct_change(5)
-    df['mom_10']      = close.pct_change(10)
-    df['mom_20']      = close.pct_change(20)
-    df['volatility']  = close.rolling(10).std()
-    df['volume_spike']= volume / df['volume_ma']
-    df['dist_sma20']  = (close - df['sma_20']) / \
-                         df['sma_20']
-    df['dist_sma50']  = (close - df['sma_50']) / \
-                         df['sma_50']
+    df['sma_20']       = close.rolling(20).mean()
+    df['sma_50']       = close.rolling(50).mean()
+    df['ema_12']       = close.ewm(span=12).mean()
+    df['rsi']          = ta.momentum.RSIIndicator(close).rsi()
+    df['macd']         = ta.trend.MACD(close).macd()
+    df['macd_sig']     = ta.trend.MACD(close).macd_signal()
+    df['bb_high']      = ta.volatility.BollingerBands(close).bollinger_hband()
+    df['bb_low']       = ta.volatility.BollingerBands(close).bollinger_lband()
+    df['volume_ma']    = volume.rolling(20).mean()
+    df['returns']      = close.pct_change()
+    df['mom_5']        = close.pct_change(5)
+    df['mom_10']       = close.pct_change(10)
+    df['mom_20']       = close.pct_change(20)
+    df['volatility']   = close.rolling(10).std()
+    df['volume_spike'] = volume / df['volume_ma']
+    df['dist_sma20']   = (close - df['sma_20']) / df['sma_20']
+    df['dist_sma50']   = (close - df['sma_50']) / df['sma_50']
     df.dropna(inplace=True)
     return df
 
-def build_options_features(vix_now, vix_prev5):
+# ── OPTIONS FEATURES ─────────────────────────────────────────
+def build_options_features():
+    # Download SPY 1 year history
     spy = yf.Ticker("SPY").history(
           period='1y', auto_adjust=True)
     spy.index = pd.to_datetime(
                 spy.index).tz_localize(None)
-    vix_tk = yf.Ticker("^VIX").history(
-             period='1y')
+
+    # Download VIX
+    vix_tk = yf.Ticker("^VIX").history(period='1y')
     vix_tk.index = pd.to_datetime(
                    vix_tk.index).tz_localize(None)
     vix = vix_tk['Close'].reindex(
-          spy.index).ffill()
+          spy.index).ffill().bfill()
 
     close = spy['Close']
     high  = spy['High']
     low   = spy['Low']
 
-    spy['hv5']  = close.pct_change().rolling(5).std() \
-                  * np.sqrt(252) * 100
-    spy['hv10'] = close.pct_change().rolling(10).std() \
-                  * np.sqrt(252) * 100
-    spy['hv20'] = close.pct_change().rolling(20).std() \
-                  * np.sqrt(252) * 100
-    spy['vix']      = vix
-    spy['vix_ma10'] = vix.rolling(10).mean()
-    spy['vix_ma20'] = vix.rolling(20).mean()
+    # Volatility features
+    spy['hv5']          = close.pct_change().rolling(5).std()  * np.sqrt(252) * 100
+    spy['hv10']         = close.pct_change().rolling(10).std() * np.sqrt(252) * 100
+    spy['hv20']         = close.pct_change().rolling(20).std() * np.sqrt(252) * 100
+    spy['vix']          = vix
+    spy['vix_ma10']     = vix.rolling(10).mean()
+    spy['vix_ma20']     = vix.rolling(20).mean()
 
-    vix_52h = vix.rolling(252).max()
-    vix_52l = vix.rolling(252).min()
+    # IV rank
+    vix_52h = vix.rolling(252, min_periods=20).max()
+    vix_52l = vix.rolling(252, min_periods=20).min()
     spy['iv_rank']      = (vix - vix_52l) / \
-                           (vix_52h - vix_52l) * 100
-    spy['iv_pct']       = vix.rolling(252).apply(
-        lambda x: (x < x.iloc[-1]).sum() /
-                  len(x) * 100, raw=False)
+                          (vix_52h - vix_52l + 0.001) * 100
+    spy['iv_pct']       = vix.rolling(252, min_periods=20).apply(
+        lambda x: (x < x.iloc[-1]).sum() / len(x) * 100,
+        raw=False)
     spy['vix_hv_ratio'] = vix / (spy['hv20'] + 0.001)
     spy['vix_chg1']     = vix.pct_change(1) * 100
     spy['vix_chg5']     = vix.pct_change(5) * 100
+
+    # Price features
     spy['sma20']        = close.rolling(20).mean()
-    spy['sma50']        = close.rolling(50).mean()
-    spy['rsi']          = ta.momentum.RSIIndicator(
-                           close).rsi()
+    spy['sma50']        = close.rolling(50, min_periods=20).mean()
+    spy['rsi']          = ta.momentum.RSIIndicator(close).rsi()
     spy['returns1']     = close.pct_change(1) * 100
     spy['returns5']     = close.pct_change(5) * 100
-    spy['dist_sma20']   = (close - spy['sma20']) / \
-                           spy['sma20'] * 100
+    spy['dist_sma20']   = (close - spy['sma20']) / spy['sma20'] * 100
+
+    # ATR
     spy['atr5']         = ta.volatility.AverageTrueRange(
         high, low, close, window=5).average_true_range()
     spy['atr14']        = ta.volatility.AverageTrueRange(
         high, low, close, window=14).average_true_range()
     spy['atr_pct']      = spy['atr14'] / close * 100
-    spy['day_of_week']  = pd.to_datetime(
-                           spy.index).dayofweek
-    spy['month']        = pd.to_datetime(
-                           spy.index).month
 
-    # KEY FIX: only drop NaN in feature columns
-    # do NOT dropna on all columns
-    # this keeps the latest rows intact
+    # Time features
+    spy['day_of_week']  = pd.to_datetime(spy.index).dayofweek
+    spy['month']        = pd.to_datetime(spy.index).month
+
+    # KEY FIX: only dropna on feature columns
+    # never dropna on all columns (removes latest rows)
     feature_cols = [
-        'hv5','hv10','hv20','vix','vix_ma10',
-        'vix_ma20','iv_rank','iv_pct',
-        'vix_hv_ratio','vix_chg1','vix_chg5',
-        'sma20','sma50','rsi','returns1',
-        'returns5','dist_sma20','atr_pct',
+        'hv5','hv10','hv20',
+        'vix','vix_ma10','vix_ma20',
+        'iv_rank','iv_pct','vix_hv_ratio',
+        'vix_chg1','vix_chg5',
+        'sma20','rsi','returns1','returns5',
+        'dist_sma20','atr_pct',
         'day_of_week','month'
     ]
+    # Forward fill then drop only rows still missing features
+    spy[feature_cols] = spy[feature_cols].ffill()
     spy.dropna(subset=feature_cols, inplace=True)
+
     return spy
 
-
-# ── STOCK SIGNAL ENDPOINT ────────────────────────────────────
+# ── STOCK SIGNAL ─────────────────────────────────────────────
 @app.route('/signal')
 def signal():
     ticker = request.args.get('ticker', 'QQQ').upper()
@@ -171,23 +170,20 @@ def signal():
         close   = df['Close']
         price   = float(close.iloc[-1])
         prev    = float(close.iloc[-2])
-        day_chg = round((price-prev)/prev*100, 2)
+        day_chg = round((price - prev) / prev * 100, 2)
         rsi_val = round(float(df['rsi'].iloc[-1]), 1)
-        sma20   = round(float(
-                    df['sma_20'].iloc[-1]), 2)
-        sma50   = round(float(
-                    df['sma_50'].iloc[-1]), 2)
+        sma20   = round(float(df['sma_20'].iloc[-1]), 2)
+        sma50   = round(float(df['sma_50'].iloc[-1]), 2)
         m       = STOCK_MODELS[ticker]
         latest  = df[m['features']].iloc[-1:]
         scaled  = m['scaler'].transform(latest)
-        proba   = float(
-            m['model'].predict_proba(scaled)[0][1])
-        if   proba >= 0.55:
+        proba   = float(m['model'].predict_proba(scaled)[0][1])
+        if proba >= 0.55:
             sig  = "BUY / HOLD"
-            conf = round(proba*100)
+            conf = round(proba * 100)
         elif proba <= 0.45:
             sig  = "SELL / STAY OUT"
-            conf = round((1-proba)*100)
+            conf = round((1 - proba) * 100)
         else:
             sig  = "HOLD / NEUTRAL"
             conf = 50
@@ -205,10 +201,7 @@ def signal():
             'status'     : 'ok'
         })
     except Exception as e:
-        return jsonify({
-            'status': 'error',
-            'error' : str(e)
-        }), 500
+        return jsonify({'status': 'error', 'error': str(e)}), 500
 
 # ── ALL STOCK SIGNALS ────────────────────────────────────────
 @app.route('/signals/all')
@@ -223,15 +216,13 @@ def all_signals():
             m     = STOCK_MODELS[ticker]
             latest= df[m['features']].iloc[-1:]
             scaled= m['scaler'].transform(latest)
-            proba = float(
-                m['model'].predict_proba(
-                    scaled)[0][1])
-            if   proba >= 0.55:
+            proba = float(m['model'].predict_proba(scaled)[0][1])
+            if proba >= 0.55:
                 sig  = "BUY / HOLD"
-                conf = round(proba*100)
+                conf = round(proba * 100)
             elif proba <= 0.45:
                 sig  = "SELL / STAY OUT"
-                conf = round((1-proba)*100)
+                conf = round((1 - proba) * 100)
             else:
                 sig  = "HOLD / NEUTRAL"
                 conf = 50
@@ -240,58 +231,58 @@ def all_signals():
                 'confidence' : conf,
                 'probability': round(proba, 4),
                 'price'      : round(price, 2),
-                'rsi'        : round(float(
-                    df['rsi'].iloc[-1]), 1),
+                'rsi'        : round(float(df['rsi'].iloc[-1]), 1),
                 'status'     : 'ok'
             }
         except Exception as e:
-            results[ticker] = {
-                'status': 'error',
-                'error' : str(e)
-            }
+            results[ticker] = {'status': 'error', 'error': str(e)}
     return jsonify(results)
 
-# ── CONDOR SIGNAL ENDPOINT ───────────────────────────────────
+# ── CONDOR SIGNAL ────────────────────────────────────────────
 @app.route('/condor')
 def condor():
     try:
-        df  = build_options_features(None, None)
-        latest   = df[OPTIONS_FEATURES].iloc[-1:]
-        close_now= float(df['Close'].iloc[-1])
-        atr_now  = float(df['atr_pct'].iloc[-1])
-        vix_now  = float(df['vix'].iloc[-1])
-        ivr_now  = float(df['iv_rank'].iloc[-1])
-        hv20_now = float(df['hv20'].iloc[-1])
-        date_now = df.index[-1].strftime('%Y-%m-%d')
+        spy = build_options_features()
+
+        # Verify we have data
+        if len(spy) == 0:
+            return jsonify({
+                'status': 'error',
+                'error' : 'No options data available'
+            }), 500
+
+        # Get latest row for signal
+        latest   = spy[OPTIONS_FEATURES].iloc[-1:]
+        close_now = float(spy['Close'].iloc[-1])
+        atr_now   = float(spy['atr_pct'].iloc[-1])
+        vix_now   = float(spy['vix'].iloc[-1])
+        ivr_now   = float(spy['iv_rank'].iloc[-1])
+        hv20_now  = float(spy['hv20'].iloc[-1])
+        date_now  = spy.index[-1].strftime('%Y-%m-%d')
 
         signals = {}
         for dte in OPTIONS_TICKERS:
             if dte not in OPTIONS_MODELS:
                 continue
-            cfg    = VIX_RULES.get(dte, {})
-            m      = OPTIONS_MODELS[dte]
-            scaled = m['scaler'].transform(latest)
-            proba  = float(
-                m['model'].predict_proba(
-                    scaled)[0][1])
-            conf     = round(proba*100, 1)
+            cfg      = VIX_RULES.get(dte, {})
+            m        = OPTIONS_MODELS[dte]
+            scaled   = m['scaler'].transform(latest)
+            proba    = float(m['model'].predict_proba(scaled)[0][1])
+            conf     = round(proba * 100, 1)
             mult     = STRIKE_MULT.get(dte, 1.0)
             rng      = mult * atr_now
-            call_s   = round(
-                close_now*(1+rng/100), 0)
-            put_s    = round(
-                close_now*(1-rng/100), 0)
+            call_s   = round(close_now * (1 + rng / 100), 0)
+            put_s    = round(close_now * (1 - rng / 100), 0)
             vix_max  = cfg.get('vix_max', 25)
             thresh   = cfg.get('threshold', 0.55)
             prem_pct = cfg.get('premium_pct', 0.35)
             stop_m   = cfg.get('stop_mult', 2.0)
             tp_m     = cfg.get('take_profit', 0.60)
             wing     = 5.00
-            prem     = wing * prem_pct
+            prem     = round(wing * prem_pct, 2)
             stop_d   = round(prem * stop_m, 2)
             tp_d     = round(prem * tp_m, 2)
-            be_wr    = round(
-                stop_m/(stop_m+tp_m)*100, 1)
+            be_wr    = round(stop_m / (stop_m + tp_m) * 100, 1)
             vix_ok   = vix_now < vix_max
             conf_ok  = proba >= thresh
 
@@ -303,19 +294,19 @@ def condor():
                 sig = "WAIT — LOW CONF"
 
             signals[dte] = {
-                'signal'      : sig,
-                'confidence'  : conf,
-                'probability' : round(proba, 4),
-                'vix_ok'      : vix_ok,
-                'conf_ok'     : conf_ok,
-                'call_strike' : call_s,
-                'put_strike'  : put_s,
-                'range_pct'   : round(rng, 2),
-                'premium_est' : round(prem, 2),
-                'take_profit' : tp_d,
-                'stop_loss'   : stop_d,
-                'breakeven_wr': be_wr,
-                'status'      : 'ok'
+                'signal'       : sig,
+                'confidence'   : conf,
+                'probability'  : round(proba, 4),
+                'vix_ok'       : vix_ok,
+                'conf_ok'      : conf_ok,
+                'call_strike'  : call_s,
+                'put_strike'   : put_s,
+                'range_pct'    : round(rng, 2),
+                'premium_est'  : prem,
+                'take_profit'  : tp_d,
+                'stop_loss'    : stop_d,
+                'breakeven_wr' : be_wr,
+                'status'       : 'ok'
             }
 
         return jsonify({
@@ -330,12 +321,9 @@ def condor():
         })
 
     except Exception as e:
-        return jsonify({
-            'status': 'error',
-            'error' : str(e)
-        }), 500
+        return jsonify({'status': 'error', 'error': str(e)}), 500
 
-# ── HEALTH CHECK ─────────────────────────────────────────────
+# ── HEALTH ───────────────────────────────────────────────────
 @app.route('/health')
 def health():
     return jsonify({
