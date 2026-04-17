@@ -1,9 +1,6 @@
-flask
-gunicorn
+fastapi
+uvicorn
+xgboost
 yfinance
 pandas
 numpy
-scikit-learn
-xgboost
-joblib
-ta
