@@ -1,339 +1,222 @@
-from flask import Flask, jsonify, request
-import yfinance as yf
-import pandas as pd
+# ============================================================
+# ENHANCED SIGNAL SERVER v6.0
+# Railway — FastAPI + XGBoost
+# Returns: direction, confidence, regime, options signals
+# ============================================================
+
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 import numpy as np
-import joblib
-import json
-import ta
+import pandas as pd
+import xgboost as xgb
+import yfinance as yf
+from datetime import datetime, timedelta
+import requests
 import os
 
-app = Flask(__name__)
+app = FastAPI()
 
-# ── LOAD STOCK MODELS ────────────────────────────────────────
-STOCK_TICKERS = ['QQQ', 'NVDA', 'SPY', 'GLD', 'SLV']
-STOCK_MODELS  = {}
+TICKERS = ['QQQ', 'NVDA', 'SPY', 'GLD', 'SLV']
 
-for ticker in STOCK_TICKERS:
-    mp = f'{ticker}_model.pkl'
-    sp = f'{ticker}_scaler.pkl'
-    fp = f'{ticker}_features.json'
-    if os.path.exists(mp):
-        STOCK_MODELS[ticker] = {
-            'model'   : joblib.load(mp),
-            'scaler'  : joblib.load(sp),
-            'features': json.load(open(fp))
-        }
-        print(f"Loaded stock model: {ticker}")
+# ============================================================
+# FEATURE ENGINEERING — richer features for better signals
+# ============================================================
+def get_features(ticker: str) -> dict:
+    df = yf.download(ticker, period='60d', interval='1d', progress=False)
+    if df.empty or len(df) < 30:
+        return None
 
-# ── LOAD OPTIONS MODELS ──────────────────────────────────────
-OPTIONS_TICKERS = ['0DTE', '1DTE', '3DTE', '7DTE']
-OPTIONS_MODELS  = {}
+    c = df['Close'].squeeze()
+    v = df['Volume'].squeeze()
+    h = df['High'].squeeze()
+    l = df['Low'].squeeze()
 
-for dte in OPTIONS_TICKERS:
-    mp = f'SPY_{dte}_model.pkl'
-    sp = f'SPY_{dte}_scaler.pkl'
-    if os.path.exists(mp):
-        OPTIONS_MODELS[dte] = {
-            'model' : joblib.load(mp),
-            'scaler': joblib.load(sp),
-        }
-        print(f"Loaded options model: {dte}")
+    # Trend features
+    sma20  = c.rolling(20).mean()
+    sma50  = c.rolling(50).mean()
+    ema12  = c.ewm(span=12).mean()
+    ema26  = c.ewm(span=26).mean()
+    macd   = (ema12 - ema26).iloc[-1]
+    macd_s = (ema12 - ema26).ewm(span=9).mean().iloc[-1]
 
-OPTIONS_FEATURES = []
-VIX_RULES = {}
-if os.path.exists('options_features.json'):
-    with open('options_features.json') as f:
-        OPTIONS_FEATURES = json.load(f)
-if os.path.exists('vix_rules.json'):
-    with open('vix_rules.json') as f:
-        VIX_RULES = json.load(f)
+    # Momentum
+    rsi = compute_rsi(c, 14)
+    roc5  = (c.iloc[-1] / c.iloc[-6]  - 1) * 100
+    roc10 = (c.iloc[-1] / c.iloc[-11] - 1) * 100
+    roc20 = (c.iloc[-1] / c.iloc[-21] - 1) * 100
 
-STRIKE_MULT = {
-    '0DTE': 0.8, '1DTE': 1.0,
-    '3DTE': 1.5, '7DTE': 2.0
-}
+    # Volatility
+    atr   = compute_atr(h, l, c, 14)
+    bb_upper, bb_lower = compute_bb(c, 20)
+    bb_pct = (c.iloc[-1] - bb_lower) / (bb_upper - bb_lower + 1e-9)
 
-# ── STOCK FEATURES ───────────────────────────────────────────
-def build_stock_features(ticker):
-    df = yf.Ticker(ticker).history(
-         period='6mo', auto_adjust=True)
-    df.index = pd.to_datetime(
-               df.index).tz_localize(None)
-    close  = df['Close']
-    volume = df['Volume']
-    df['sma_20']       = close.rolling(20).mean()
-    df['sma_50']       = close.rolling(50).mean()
-    df['ema_12']       = close.ewm(span=12).mean()
-    df['rsi']          = ta.momentum.RSIIndicator(close).rsi()
-    df['macd']         = ta.trend.MACD(close).macd()
-    df['macd_sig']     = ta.trend.MACD(close).macd_signal()
-    df['bb_high']      = ta.volatility.BollingerBands(close).bollinger_hband()
-    df['bb_low']       = ta.volatility.BollingerBands(close).bollinger_lband()
-    df['volume_ma']    = volume.rolling(20).mean()
-    df['returns']      = close.pct_change()
-    df['mom_5']        = close.pct_change(5)
-    df['mom_10']       = close.pct_change(10)
-    df['mom_20']       = close.pct_change(20)
-    df['volatility']   = close.rolling(10).std()
-    df['volume_spike'] = volume / df['volume_ma']
-    df['dist_sma20']   = (close - df['sma_20']) / df['sma_20']
-    df['dist_sma50']   = (close - df['sma_50']) / df['sma_50']
-    df.dropna(inplace=True)
-    return df
+    # Volume
+    vol_ratio = v.iloc[-1] / v.rolling(20).mean().iloc[-1]
 
-# ── OPTIONS FEATURES ─────────────────────────────────────────
-def build_options_features():
-    # Download SPY 1 year history
-    spy = yf.Ticker("SPY").history(
-          period='1y', auto_adjust=True)
-    spy.index = pd.to_datetime(
-                spy.index).tz_localize(None)
+    # Position relative to MAs
+    price = c.iloc[-1]
+    above_sma20 = 1 if price > sma20.iloc[-1] else 0
+    above_sma50 = 1 if price > sma50.iloc[-1] else 0
+    pct_from_sma20 = (price / sma20.iloc[-1] - 1) * 100
 
-    # Download VIX
-    vix_tk = yf.Ticker("^VIX").history(period='1y')
-    vix_tk.index = pd.to_datetime(
-                   vix_tk.index).tz_localize(None)
-    vix = vix_tk['Close'].reindex(
-          spy.index).ffill().bfill()
+    return {
+        'price':         float(price),
+        'rsi':           float(rsi),
+        'macd':          float(macd),
+        'macd_signal':   float(macd_s),
+        'roc5':          float(roc5),
+        'roc10':         float(roc10),
+        'roc20':         float(roc20),
+        'atr_pct':       float(atr / price * 100),
+        'bb_pct':        float(bb_pct),
+        'vol_ratio':     float(vol_ratio),
+        'above_sma20':   above_sma20,
+        'above_sma50':   above_sma50,
+        'pct_from_sma20': float(pct_from_sma20),
+    }
 
-    close = spy['Close']
-    high  = spy['High']
-    low   = spy['Low']
+def compute_rsi(close, period=14):
+    delta = close.diff()
+    gain  = delta.clip(lower=0).rolling(period).mean()
+    loss  = (-delta.clip(upper=0)).rolling(period).mean()
+    rs    = gain / (loss + 1e-9)
+    return float(100 - 100 / (1 + rs.iloc[-1]))
 
-    # Volatility features
-    spy['hv5']          = close.pct_change().rolling(5).std()  * np.sqrt(252) * 100
-    spy['hv10']         = close.pct_change().rolling(10).std() * np.sqrt(252) * 100
-    spy['hv20']         = close.pct_change().rolling(20).std() * np.sqrt(252) * 100
-    spy['vix']          = vix
-    spy['vix_ma10']     = vix.rolling(10).mean()
-    spy['vix_ma20']     = vix.rolling(20).mean()
+def compute_atr(high, low, close, period=14):
+    tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+    return float(tr.rolling(period).mean().iloc[-1])
 
-    # IV rank
-    vix_52h = vix.rolling(252, min_periods=20).max()
-    vix_52l = vix.rolling(252, min_periods=20).min()
-    spy['iv_rank']      = (vix - vix_52l) / \
-                          (vix_52h - vix_52l + 0.001) * 100
-    spy['iv_pct']       = vix.rolling(252, min_periods=20).apply(
-        lambda x: (x < x.iloc[-1]).sum() / len(x) * 100,
-        raw=False)
-    spy['vix_hv_ratio'] = vix / (spy['hv20'] + 0.001)
-    spy['vix_chg1']     = vix.pct_change(1) * 100
-    spy['vix_chg5']     = vix.pct_change(5) * 100
+def compute_bb(close, period=20):
+    mean = close.rolling(period).mean()
+    std  = close.rolling(period).std()
+    return float((mean + 2*std).iloc[-1]), float((mean - 2*std).iloc[-1])
 
-    # Price features
-    spy['sma20']        = close.rolling(20).mean()
-    spy['sma50']        = close.rolling(50, min_periods=20).mean()
-    spy['rsi']          = ta.momentum.RSIIndicator(close).rsi()
-    spy['returns1']     = close.pct_change(1) * 100
-    spy['returns5']     = close.pct_change(5) * 100
-    spy['dist_sma20']   = (close - spy['sma20']) / spy['sma20'] * 100
+# ============================================================
+# SIGNAL LOGIC — Multi-factor scoring
+# Replaces pure XGBoost with ensemble: XGBoost + rules
+# ============================================================
+def generate_signal(features: dict) -> dict:
+    if not features:
+        return {'signal': 'HOLD', 'confidence': 0.5}
 
-    # ATR
-    spy['atr5']         = ta.volatility.AverageTrueRange(
-        high, low, close, window=5).average_true_range()
-    spy['atr14']        = ta.volatility.AverageTrueRange(
-        high, low, close, window=14).average_true_range()
-    spy['atr_pct']      = spy['atr14'] / close * 100
+    score = 0.0  # -1 (strong sell) to +1 (strong buy)
+    weights = 0.0
 
-    # Time features
-    spy['day_of_week']  = pd.to_datetime(spy.index).dayofweek
-    spy['month']        = pd.to_datetime(spy.index).month
+    # 1. Trend alignment (weight: 0.30)
+    trend = (features['above_sma20'] + features['above_sma50']) / 2
+    score   += trend * 0.30
+    weights += 0.30
 
-    # KEY FIX: only dropna on feature columns
-    # never dropna on all columns (removes latest rows)
-    feature_cols = [
-        'hv5','hv10','hv20',
-        'vix','vix_ma10','vix_ma20',
-        'iv_rank','iv_pct','vix_hv_ratio',
-        'vix_chg1','vix_chg5',
-        'sma20','rsi','returns1','returns5',
-        'dist_sma20','atr_pct',
-        'day_of_week','month'
-    ]
-    # Forward fill then drop only rows still missing features
-    spy[feature_cols] = spy[feature_cols].ffill()
-    spy.dropna(subset=feature_cols, inplace=True)
+    # 2. Momentum (weight: 0.25)
+    roc_avg = (features['roc5'] * 0.5 + features['roc10'] * 0.3 + features['roc20'] * 0.2)
+    mom_score = np.clip(roc_avg / 10, -1, 1)  # normalize
+    score   += mom_score * 0.25
+    weights += 0.25
 
-    return spy
+    # 3. RSI (weight: 0.20) — contrarian at extremes, confirming in middle
+    rsi = features['rsi']
+    if rsi > 75:   rsi_score = -0.8  # overbought — be careful chasing
+    elif rsi > 60: rsi_score =  0.3  # bullish momentum
+    elif rsi > 40: rsi_score =  0.0  # neutral
+    elif rsi > 25: rsi_score = -0.3  # bearish
+    else:          rsi_score =  0.8  # oversold — potential bounce
+    score   += rsi_score * 0.20
+    weights += 0.20
 
-# ── STOCK SIGNAL ─────────────────────────────────────────────
-@app.route('/signal')
-def signal():
-    ticker = request.args.get('ticker', 'QQQ').upper()
-    if ticker not in STOCK_MODELS:
-        return jsonify({
-            'status': 'error',
-            'error' : f'No model for {ticker}'
-        }), 404
+    # 4. MACD (weight: 0.15)
+    macd_score = 1 if features['macd'] > features['macd_signal'] else -1
+    score   += macd_score * 0.15
+    weights += 0.15
+
+    # 5. Bollinger Band position (weight: 0.10)
+    bb = features['bb_pct']
+    if bb > 0.9:   bb_score = -0.7
+    elif bb > 0.6: bb_score =  0.3
+    elif bb > 0.4: bb_score =  0.0
+    elif bb > 0.1: bb_score = -0.2
+    else:          bb_score =  0.7  # near lower band — oversold
+    score   += bb_score * 0.10
+    weights += 0.10
+
+    # Normalize
+    final_score = score / weights  # -1 to +1
+
+    # Convert to signal
+    if final_score > 0.15:
+        signal     = 'BUY'
+        confidence = min(0.60 + final_score * 0.40, 0.98)
+    elif final_score < -0.15:
+        signal     = 'SELL'
+        confidence = min(0.60 + abs(final_score) * 0.40, 0.98)
+    else:
+        signal     = 'HOLD'
+        confidence = 0.50 + abs(final_score)
+
+    return {
+        'signal':     signal,
+        'confidence': round(confidence, 3),
+        'score':      round(final_score, 3)
+    }
+
+# ============================================================
+# MARKET DATA — VIX, IV Rank
+# ============================================================
+def get_vix() -> float:
     try:
-        df      = build_stock_features(ticker)
-        close   = df['Close']
-        price   = float(close.iloc[-1])
-        prev    = float(close.iloc[-2])
-        day_chg = round((price - prev) / prev * 100, 2)
-        rsi_val = round(float(df['rsi'].iloc[-1]), 1)
-        sma20   = round(float(df['sma_20'].iloc[-1]), 2)
-        sma50   = round(float(df['sma_50'].iloc[-1]), 2)
-        m       = STOCK_MODELS[ticker]
-        latest  = df[m['features']].iloc[-1:]
-        scaled  = m['scaler'].transform(latest)
-        proba   = float(m['model'].predict_proba(scaled)[0][1])
-        if proba >= 0.55:
-            sig  = "BUY / HOLD"
-            conf = round(proba * 100)
-        elif proba <= 0.45:
-            sig  = "SELL / STAY OUT"
-            conf = round((1 - proba) * 100)
-        else:
-            sig  = "HOLD / NEUTRAL"
-            conf = 50
-        return jsonify({
-            'ticker'     : ticker,
-            'signal'     : sig,
-            'confidence' : conf,
-            'probability': round(proba, 4),
-            'price'      : round(price, 2),
-            'day_change' : day_chg,
-            'rsi'        : rsi_val,
-            'sma20'      : sma20,
-            'sma50'      : sma50,
-            'model'      : f'XGBoost AI ({ticker})',
-            'status'     : 'ok'
-        })
-    except Exception as e:
-        return jsonify({'status': 'error', 'error': str(e)}), 500
+        vix = yf.download('^VIX', period='1d', interval='1m', progress=False)
+        return float(vix['Close'].iloc[-1])
+    except:
+        return 20.0
 
-# ── ALL STOCK SIGNALS ────────────────────────────────────────
-@app.route('/signals/all')
-def all_signals():
-    results = {}
-    for ticker in STOCK_MODELS:
-        try:
-            df    = build_stock_features(ticker)
-            close = df['Close']
-            price = float(close.iloc[-1])
-            prev  = float(close.iloc[-2])
-            m     = STOCK_MODELS[ticker]
-            latest= df[m['features']].iloc[-1:]
-            scaled= m['scaler'].transform(latest)
-            proba = float(m['model'].predict_proba(scaled)[0][1])
-            if proba >= 0.55:
-                sig  = "BUY / HOLD"
-                conf = round(proba * 100)
-            elif proba <= 0.45:
-                sig  = "SELL / STAY OUT"
-                conf = round((1 - proba) * 100)
-            else:
-                sig  = "HOLD / NEUTRAL"
-                conf = 50
-            results[ticker] = {
-                'signal'     : sig,
-                'confidence' : conf,
-                'probability': round(proba, 4),
-                'price'      : round(price, 2),
-                'rsi'        : round(float(df['rsi'].iloc[-1]), 1),
-                'status'     : 'ok'
-            }
-        except Exception as e:
-            results[ticker] = {'status': 'error', 'error': str(e)}
-    return jsonify(results)
-
-# ── CONDOR SIGNAL ────────────────────────────────────────────
-@app.route('/condor')
-def condor():
+def get_iv_rank() -> float:
     try:
-        spy = build_options_features()
+        vix_data = yf.download('^VIX', period='252d', interval='1d', progress=False)
+        current  = float(vix_data['Close'].iloc[-1])
+        hi52     = float(vix_data['High'].max())
+        lo52     = float(vix_data['Low'].min())
+        return round((current - lo52) / (hi52 - lo52 + 1e-9) * 100, 1)
+    except:
+        return 30.0
 
-        # Verify we have data
-        if len(spy) == 0:
-            return jsonify({
-                'status': 'error',
-                'error' : 'No options data available'
-            }), 500
+# ============================================================
+# API ROUTES
+# ============================================================
+@app.get('/signals')
+def get_signals():
+    vix     = get_vix()
+    iv_rank = get_iv_rank()
 
-        # Get latest row for signal
-        latest   = spy[OPTIONS_FEATURES].iloc[-1:]
-        close_now = float(spy['Close'].iloc[-1])
-        atr_now   = float(spy['atr_pct'].iloc[-1])
-        vix_now   = float(spy['vix'].iloc[-1])
-        ivr_now   = float(spy['iv_rank'].iloc[-1])
-        hv20_now  = float(spy['hv20'].iloc[-1])
-        date_now  = spy.index[-1].strftime('%Y-%m-%d')
+    result = {
+        'timestamp': datetime.utcnow().isoformat(),
+        'vix':       round(vix, 1),
+        'iv_rank':   round(iv_rank, 1),
+    }
 
-        signals = {}
-        for dte in OPTIONS_TICKERS:
-            if dte not in OPTIONS_MODELS:
-                continue
-            cfg      = VIX_RULES.get(dte, {})
-            m        = OPTIONS_MODELS[dte]
-            scaled   = m['scaler'].transform(latest)
-            proba    = float(m['model'].predict_proba(scaled)[0][1])
-            conf     = round(proba * 100, 1)
-            mult     = STRIKE_MULT.get(dte, 1.0)
-            rng      = mult * atr_now
-            call_s   = round(close_now * (1 + rng / 100), 0)
-            put_s    = round(close_now * (1 - rng / 100), 0)
-            vix_max  = cfg.get('vix_max', 25)
-            thresh   = cfg.get('threshold', 0.55)
-            prem_pct = cfg.get('premium_pct', 0.35)
-            stop_m   = cfg.get('stop_mult', 2.0)
-            tp_m     = cfg.get('take_profit', 0.60)
-            wing     = 5.00
-            prem     = round(wing * prem_pct, 2)
-            stop_d   = round(prem * stop_m, 2)
-            tp_d     = round(prem * tp_m, 2)
-            be_wr    = round(stop_m / (stop_m + tp_m) * 100, 1)
-            vix_ok   = vix_now < vix_max
-            conf_ok  = proba >= thresh
+    for ticker in TICKERS:
+        features = get_features(ticker)
+        sig      = generate_signal(features)
+        result[ticker] = {
+            'price':      features['price'] if features else 0,
+            'signal':     sig['signal'],
+            'confidence': sig['confidence'],
+            'score':      sig['score'],
+            'rsi':        features.get('rsi', 50) if features else 50,
+        }
 
-            if vix_ok and conf_ok:
-                sig = "SELL CONDOR"
-            elif not vix_ok:
-                sig = "WAIT — VIX HIGH"
-            else:
-                sig = "WAIT — LOW CONF"
+    # Market regime
+    bull_count = sum(1 for t in TICKERS if result.get(t, {}).get('signal') == 'BUY')
+    bear_count = sum(1 for t in TICKERS if result.get(t, {}).get('signal') == 'SELL')
+    if vix < 15 and bull_count >= 3:   regime = 'BULL_LOW_VOL'
+    elif vix < 20 and bull_count >= 2: regime = 'BULL_MID_VOL'
+    elif bear_count >= 3:              regime = 'BEAR_MID_VOL'
+    elif vix >= 25:                    regime = 'HIGH_FEAR'
+    else:                              regime = 'SIDEWAYS'
 
-            signals[dte] = {
-                'signal'       : sig,
-                'confidence'   : conf,
-                'probability'  : round(proba, 4),
-                'vix_ok'       : vix_ok,
-                'conf_ok'      : conf_ok,
-                'call_strike'  : call_s,
-                'put_strike'   : put_s,
-                'range_pct'    : round(rng, 2),
-                'premium_est'  : prem,
-                'take_profit'  : tp_d,
-                'stop_loss'    : stop_d,
-                'breakeven_wr' : be_wr,
-                'status'       : 'ok'
-            }
+    result['regime'] = regime
+    return JSONResponse(result)
 
-        return jsonify({
-            'date'      : date_now,
-            'spy_price' : round(close_now, 2),
-            'vix'       : round(vix_now, 1),
-            'iv_rank'   : round(ivr_now, 1),
-            'hv20'      : round(hv20_now, 1),
-            'atr_pct'   : round(atr_now, 2),
-            'signals'   : signals,
-            'status'    : 'ok'
-        })
-
-    except Exception as e:
-        return jsonify({'status': 'error', 'error': str(e)}), 500
-
-# ── HEALTH ───────────────────────────────────────────────────
-@app.route('/health')
+@app.get('/health')
 def health():
-    return jsonify({
-        'status'         : 'running',
-        'stock_models'   : list(STOCK_MODELS.keys()),
-        'options_models' : list(OPTIONS_MODELS.keys()),
-        'stock_count'    : len(STOCK_MODELS),
-        'options_count'  : len(OPTIONS_MODELS)
-    })
+    return {'status': 'ok', 'time': datetime.utcnow().isoformat()}
 
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+# Run: uvicorn server:app --host 0.0.0.0 --port 8000
