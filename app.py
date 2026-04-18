@@ -22,8 +22,8 @@ TICKERS = ['QQQ', 'NVDA', 'SPY', 'GLD', 'SLV']
 # FEATURE ENGINEERING — richer features for better signals
 # ============================================================
 def get_features(ticker: str) -> dict:
-    df = yf.download(ticker, period='60d', interval='1d', progress=False)
-    if df.empty or len(df) < 30:
+    df  = yf.download(ticker, period='252d', interval='1d', progress=False)
+    if df.empty or len(df) < 50:
         return None
 
     c = df['Close'].squeeze()
@@ -34,44 +34,65 @@ def get_features(ticker: str) -> dict:
     # Trend features
     sma20  = c.rolling(20).mean()
     sma50  = c.rolling(50).mean()
+    sma200 = c.rolling(200).mean()
     ema12  = c.ewm(span=12).mean()
     ema26  = c.ewm(span=26).mean()
     macd   = (ema12 - ema26).iloc[-1]
     macd_s = (ema12 - ema26).ewm(span=9).mean().iloc[-1]
 
     # Momentum
-    rsi = compute_rsi(c, 14)
+    rsi   = compute_rsi(c, 14)
     roc5  = (c.iloc[-1] / c.iloc[-6]  - 1) * 100
     roc10 = (c.iloc[-1] / c.iloc[-11] - 1) * 100
     roc20 = (c.iloc[-1] / c.iloc[-21] - 1) * 100
 
     # Volatility
-    atr   = compute_atr(h, l, c, 14)
+    atr      = compute_atr(h, l, c, 14)
     bb_upper, bb_lower = compute_bb(c, 20)
-    bb_pct = (c.iloc[-1] - bb_lower) / (bb_upper - bb_lower + 1e-9)
+    bb_pct   = (c.iloc[-1] - bb_lower) / (bb_upper - bb_lower + 1e-9)
 
     # Volume
     vol_ratio = v.iloc[-1] / v.rolling(20).mean().iloc[-1]
 
-    # Position relative to MAs
-    price = c.iloc[-1]
-    above_sma20 = 1 if price > sma20.iloc[-1] else 0
-    above_sma50 = 1 if price > sma50.iloc[-1] else 0
-    pct_from_sma20 = (price / sma20.iloc[-1] - 1) * 100
+    # Price data
+    price      = float(c.iloc[-1])
+    prev_close = float(c.iloc[-2]) if len(c) > 1 else price
+    day_change = round((price / prev_close - 1) * 100, 2)
+
+    # ATH (52-week high)
+    ath        = float(h.rolling(252).max().iloc[-1])
+    from_ath   = round((price / ath - 1) * 100, 2)
+
+    # SMA values
+    sma20_val  = float(sma20.iloc[-1])  if not pd.isna(sma20.iloc[-1])  else price
+    sma50_val  = float(sma50.iloc[-1])  if not pd.isna(sma50.iloc[-1])  else price
+    sma200_val = float(sma200.iloc[-1]) if not pd.isna(sma200.iloc[-1]) else price
+
+    above_sma20    = 1 if price > sma20_val  else 0
+    above_sma50    = 1 if price > sma50_val  else 0
+    pct_from_sma20 = (price / sma20_val - 1) * 100
 
     return {
-        'price':         float(price),
-        'rsi':           float(rsi),
-        'macd':          float(macd),
-        'macd_signal':   float(macd_s),
-        'roc5':          float(roc5),
-        'roc10':         float(roc10),
-        'roc20':         float(roc20),
-        'atr_pct':       float(atr / price * 100),
-        'bb_pct':        float(bb_pct),
-        'vol_ratio':     float(vol_ratio),
-        'above_sma20':   above_sma20,
-        'above_sma50':   above_sma50,
+        'price':          price,
+        'prev_close':     prev_close,
+        'day_change':     day_change,
+        'sma20':          round(sma20_val,  2),
+        'sma50':          round(sma50_val,  2),
+        'sma200':         round(sma200_val, 2),
+        'ath':            round(ath, 2),
+        'from_ath':       from_ath,
+        'atr':            round(float(atr), 2),
+        'atr_pct':        round(float(atr / price * 100), 2),
+        'rsi':            float(rsi),
+        'macd':           float(macd),
+        'macd_signal':    float(macd_s),
+        'roc5':           float(roc5),
+        'roc10':          float(roc10),
+        'roc20':          float(roc20),
+        'bb_pct':         float(bb_pct),
+        'vol_ratio':      float(vol_ratio),
+        'above_sma20':    above_sma20,
+        'above_sma50':    above_sma50,
         'pct_from_sma20': float(pct_from_sma20),
     }
 
@@ -196,11 +217,18 @@ def get_signals():
         features = get_features(ticker)
         sig      = generate_signal(features)
         result[ticker] = {
-            'price':      features['price'] if features else 0,
+            'price':      features['price']       if features else 0,
+            'day_change': features['day_change']   if features else 0,
+            'sma20':      features['sma20']        if features else 0,
+            'sma50':      features['sma50']        if features else 0,
+            'sma200':     features['sma200']       if features else 0,
+            'from_ath':   features['from_ath']     if features else 0,
+            'atr':        features['atr']          if features else 0,
+            'atr_pct':    features['atr_pct']      if features else 0,
+            'rsi':        round(features['rsi'],1) if features else 50,
             'signal':     sig['signal'],
             'confidence': sig['confidence'],
             'score':      sig['score'],
-            'rsi':        features.get('rsi', 50) if features else 50,
         }
 
     # Market regime
