@@ -19,6 +19,209 @@ app = FastAPI()
 TICKERS = ['QQQ', 'NVDA', 'SPY', 'GLD', 'SLV']
 
 # ============================================================
+# LIVE EARNINGS CALENDAR — auto-fetched via yfinance
+# ============================================================
+from datetime import datetime, timedelta
+import json
+
+_earnings_cache = {}
+_earnings_cache_time = {}
+CACHE_HOURS = 24
+
+def get_earnings_date(ticker: str) -> dict:
+    """Fetch next earnings date automatically using yfinance."""
+    now = datetime.utcnow()
+    
+    # Return cache if fresh
+    if ticker in _earnings_cache:
+        age = (now - _earnings_cache_time[ticker]).total_seconds() / 3600
+        if age < CACHE_HOURS:
+            return _earnings_cache[ticker]
+    
+    try:
+        stock = yf.Ticker(ticker)
+        cal   = stock.calendar
+        
+        result = {
+            'ticker':         ticker,
+            'has_earnings':   False,
+            'next_date':      None,
+            'days_until':     None,
+            'blackout':       False,  # True if within 3 days
+        }
+
+        if cal is not None and not cal.empty:
+            # calendar returns a DataFrame with dates as columns
+            dates = cal.columns.tolist()
+            if dates:
+                earn_date = dates[0]
+                if hasattr(earn_date, 'date'):
+                    earn_date = earn_date.date()
+                else:
+                    earn_date = datetime.strptime(str(earn_date)[:10], '%Y-%m-%d').date()
+                
+                today      = now.date()
+                days_until = (earn_date - today).days
+                
+                result['has_earnings'] = True
+                result['next_date']    = str(earn_date)
+                result['days_until']   = days_until
+                result['blackout']     = -1 <= days_until <= 3  # blackout 1 day before to 3 days after
+
+        _earnings_cache[ticker]      = result
+        _earnings_cache_time[ticker] = now
+        return result
+
+    except Exception as e:
+        print(f"Earnings fetch error for {ticker}: {e}")
+        fallback = {'ticker': ticker, 'has_earnings': False, 'next_date': None, 'days_until': None, 'blackout': False}
+        _earnings_cache[ticker]      = fallback
+        _earnings_cache_time[ticker] = now
+        return fallback
+
+def get_all_earnings() -> dict:
+    """Fetch earnings for all tickers."""
+    results = {}
+    for ticker in TICKERS:
+        results[ticker] = get_earnings_date(ticker)
+    return results
+
+# ============================================================
+# NEWS SENTIMENT + MACRO EVENTS — auto analysis
+# ============================================================
+import re
+from datetime import datetime, timedelta
+
+# Macro event calendar — key dates that move markets
+# Auto-updates via FRED/yfinance
+MACRO_KEYWORDS = {
+    'bearish': ['rate hike','inflation surge','recession','layoffs','tariff',
+                'sanctions','war escalation','bank failure','debt ceiling',
+                'fed tightening','yield inversion','earnings miss'],
+    'bullish': ['rate cut','soft landing','strong jobs','earnings beat',
+                'trade deal','ceasefire','stimulus','fed pause',
+                'gdp beat','inflation falls','rate hold'],
+}
+
+TICKER_KEYWORDS = {
+    'NVDA': ['nvidia','nvda','gpu','ai chip','cuda','blackwell','h100','data center'],
+    'QQQ':  ['nasdaq','tech stocks','qqq','faang','big tech','rates','treasury'],
+    'SPY':  ['s&p','spy','market rally','correction','dow','broad market'],
+    'GLD':  ['gold','inflation','dollar','safe haven','fed','gld'],
+    'SLV':  ['silver','slv','industrial metals','solar','ev'],
+}
+
+def score_headline(headline: str, ticker: str = None) -> float:
+    """Score a headline -1.0 (bearish) to +1.0 (bullish)."""
+    h = headline.lower()
+    score = 0.0
+
+    # General market sentiment
+    for word in MACRO_KEYWORDS['bullish']:
+        if word in h: score += 0.3
+    for word in MACRO_KEYWORDS['bearish']:
+        if word in h: score -= 0.3
+
+    # Ticker-specific
+    if ticker and ticker in TICKER_KEYWORDS:
+        keywords = TICKER_KEYWORDS[ticker]
+        relevant = any(k in h for k in keywords)
+        if relevant:
+            score *= 1.5  # amplify if ticker-relevant
+
+    return max(-1.0, min(1.0, score))
+
+def get_news_sentiment(ticker: str) -> dict:
+    """Get news sentiment for a ticker using yfinance."""
+    try:
+        stock = yf.Ticker(ticker)
+        news  = stock.news or []
+
+        if not news:
+            return {'ticker': ticker, 'sentiment': 0.0, 'signal': 'NEUTRAL',
+                    'headlines': [], 'article_count': 0}
+
+        scores    = []
+        headlines = []
+        cutoff    = datetime.utcnow() - timedelta(hours=48)
+
+        for article in news[:10]:  # last 10 articles
+            title = article.get('title', '')
+            if not title: continue
+
+            # Check recency
+            pub_time = article.get('providerPublishTime', 0)
+            if pub_time:
+                pub_dt = datetime.utcfromtimestamp(pub_time)
+                if pub_dt < cutoff: continue
+
+            score = score_headline(title, ticker)
+            scores.append(score)
+            headlines.append({'title': title[:100], 'score': round(score, 2)})
+
+        avg_score = sum(scores) / len(scores) if scores else 0.0
+
+        signal = 'BULLISH' if avg_score > 0.15 else 'BEARISH' if avg_score < -0.15 else 'NEUTRAL'
+
+        return {
+            'ticker':        ticker,
+            'sentiment':     round(avg_score, 3),
+            'signal':        signal,
+            'headlines':     headlines[:5],
+            'article_count': len(scores),
+        }
+    except Exception as e:
+        print(f"News error for {ticker}: {e}")
+        return {'ticker': ticker, 'sentiment': 0.0, 'signal': 'NEUTRAL',
+                'headlines': [], 'article_count': 0}
+
+def get_macro_context() -> dict:
+    """Get macro market context — VIX term structure, yield curve, dollar."""
+    try:
+        # VIX
+        vix_data  = yf.download('^VIX', period='5d', interval='1d', progress=False)
+        vix_now   = float(vix_data['Close'].iloc[-1]) if not vix_data.empty else 20.0
+        vix_prev  = float(vix_data['Close'].iloc[-2]) if len(vix_data) > 1 else vix_now
+        vix_trend = 'RISING' if vix_now > vix_prev * 1.05 else 'FALLING' if vix_now < vix_prev * 0.95 else 'STABLE'
+
+        # 10Y Treasury yield
+        tnx = yf.download('^TNX', period='5d', interval='1d', progress=False)
+        yield_10y = float(tnx['Close'].iloc[-1]) if not tnx.empty else 4.5
+
+        # DXY (Dollar)
+        dxy = yf.download('DX-Y.NYB', period='5d', interval='1d', progress=False)
+        dollar = float(dxy['Close'].iloc[-1]) if not dxy.empty else 100.0
+
+        # Market stress score 0-100
+        stress = 50
+        if vix_now > 25: stress += 25
+        elif vix_now > 20: stress += 10
+        if vix_trend == 'RISING': stress += 10
+        if yield_10y > 5.0: stress += 10
+        stress = min(100, max(0, stress))
+
+        return {
+            'vix':           round(vix_now, 1),
+            'vix_trend':     vix_trend,
+            'yield_10y':     round(yield_10y, 2),
+            'dollar_dxy':    round(dollar, 2),
+            'stress_score':  stress,
+            'stress_label':  'HIGH' if stress > 70 else 'MODERATE' if stress > 40 else 'LOW',
+        }
+    except Exception as e:
+        print(f"Macro error: {e}")
+        return {'vix': 20.0, 'vix_trend': 'STABLE', 'yield_10y': 4.5,
+                'dollar_dxy': 100.0, 'stress_score': 50, 'stress_label': 'MODERATE'}
+
+def get_all_news_sentiment() -> dict:
+    """Get news sentiment for all tickers."""
+    result = {}
+    for ticker in TICKERS:
+        result[ticker] = get_news_sentiment(ticker)
+    return result
+
+
+# ============================================================
 # FEATURE ENGINEERING — richer features for better signals
 # ============================================================
 def get_features(ticker: str) -> dict:
@@ -241,7 +444,42 @@ def get_signals():
     else:                              regime = 'SIDEWAYS'
 
     result['regime'] = regime
+    
+    # Add live earnings data
+    earnings = get_all_earnings()
+    result['earnings'] = earnings
+
+    # Add news sentiment (cached — only refresh every 2 hours)
+    try:
+        news_data = get_all_news_sentiment()
+        result['news'] = news_data
+    except Exception as e:
+        result['news'] = {}
+        print(f"News fetch error: {e}")
+
+    # Add macro context
+    try:
+        result['macro'] = get_macro_context()
+    except Exception as e:
+        result['macro'] = {}
+        print(f"Macro fetch error: {e}")
+
     return JSONResponse(result)
+
+@app.get('/earnings')
+def earnings_endpoint():
+    """Dedicated earnings calendar endpoint."""
+    return JSONResponse(get_all_earnings())
+
+@app.get('/news')
+def news_endpoint():
+    """News sentiment for all tickers."""
+    return JSONResponse(get_all_news_sentiment())
+
+@app.get('/macro')
+def macro_endpoint():
+    """Macro market context."""
+    return JSONResponse(get_macro_context())
 
 @app.get('/health')
 def health():
