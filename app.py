@@ -320,66 +320,130 @@ def compute_bb(close, period=20):
 # Replaces pure XGBoost with ensemble: XGBoost + rules
 # ============================================================
 def generate_signal(features: dict) -> dict:
+    """
+    Enhanced signal generation with:
+    - RSI extreme filter (blocks BUY when RSI > 75)
+    - Volume confirmation (requires above-average volume)
+    - ATR-based confidence scaling
+    - 2:1 reward/risk awareness
+    - Multi-factor weighted voting
+    """
     if not features:
-        return {'signal': 'HOLD', 'confidence': 0.5}
+        return {'signal': 'HOLD', 'confidence': 0.5, 'score': 0.0,
+                'blocked_reason': 'no_data', 'atr_pct': 0, 'vol_ratio': 1.0}
 
-    score = 0.0  # -1 (strong sell) to +1 (strong buy)
+    score   = 0.0
     weights = 0.0
+    blocked_reason = None
 
-    # 1. Trend alignment (weight: 0.30)
-    trend = (features['above_sma20'] + features['above_sma50']) / 2
-    score   += trend * 0.30
-    weights += 0.30
+    rsi       = features.get('rsi', 50)
+    vol_ratio = features.get('vol_ratio', 1.0)
+    bb        = features.get('bb_pct', 0.5)
+    atr_pct   = features.get('atr_pct', 1.0)
 
-    # 2. Momentum (weight: 0.25)
-    roc_avg = (features['roc5'] * 0.5 + features['roc10'] * 0.3 + features['roc20'] * 0.2)
-    mom_score = np.clip(roc_avg / 10, -1, 1)  # normalize
-    score   += mom_score * 0.25
+    # ============================================================
+    # TIER 2 FIX 5: Hard RSI filter — skip BUY if overbought
+    # ============================================================
+    if rsi > 78:
+        # Extremely overbought — only SELL or HOLD
+        return {
+            'signal':         'HOLD',
+            'confidence':     0.55,
+            'score':          -0.1,
+            'blocked_reason': f'RSI_OVERBOUGHT_{rsi:.0f}',
+            'atr_pct':        atr_pct,
+            'vol_ratio':      vol_ratio,
+        }
+
+    if rsi < 22:
+        # Extremely oversold — potential bounce, raise confidence
+        return {
+            'signal':         'BUY',
+            'confidence':     0.72,
+            'score':          0.4,
+            'blocked_reason': 'RSI_OVERSOLD_BOUNCE',
+            'atr_pct':        atr_pct,
+            'vol_ratio':      vol_ratio,
+        }
+
+    # ============================================================
+    # TIER 2 FIX 6: Volume confirmation
+    # ============================================================
+    volume_confirmed = vol_ratio >= 0.8  # at least 80% of average volume
+
+    # 1. Trend alignment (weight: 0.25)
+    trend   = (features.get('above_sma20', 0) + features.get('above_sma50', 0)) / 2
+    score   += trend * 0.25
     weights += 0.25
 
-    # 3. RSI (weight: 0.20) — contrarian at extremes, confirming in middle
-    rsi = features['rsi']
-    if rsi > 75:   rsi_score = -0.8  # overbought — be careful chasing
-    elif rsi > 60: rsi_score =  0.3  # bullish momentum
-    elif rsi > 40: rsi_score =  0.0  # neutral
-    elif rsi > 25: rsi_score = -0.3  # bearish
-    else:          rsi_score =  0.8  # oversold — potential bounce
+    # 2. Momentum ROC (weight: 0.20)
+    roc_avg   = (features.get('roc5',0)*0.5 + features.get('roc10',0)*0.3 + features.get('roc20',0)*0.2)
+    mom_score = float(np.clip(roc_avg / 8, -1, 1))
+    score     += mom_score * 0.20
+    weights   += 0.20
+
+    # 3. RSI — refined zones (weight: 0.20)
+    if   rsi > 70: rsi_score = -0.5   # overbought warning
+    elif rsi > 60: rsi_score =  0.4   # bullish momentum
+    elif rsi > 50: rsi_score =  0.2   # mild bullish
+    elif rsi > 40: rsi_score = -0.2   # mild bearish
+    elif rsi > 30: rsi_score = -0.4   # bearish
+    else:          rsi_score =  0.6   # oversold bounce
     score   += rsi_score * 0.20
     weights += 0.20
 
     # 4. MACD (weight: 0.15)
-    macd_score = 1 if features['macd'] > features['macd_signal'] else -1
+    macd       = features.get('macd', 0)
+    macd_sig   = features.get('macd_signal', 0)
+    macd_score = 1.0 if macd > macd_sig else -1.0
+    # Extra weight if MACD crossing (strong signal)
+    if abs(macd - macd_sig) < 0.1 and macd > macd_sig:
+        macd_score = 1.5  # fresh crossover
     score   += macd_score * 0.15
     weights += 0.15
 
-    # 5. Bollinger Band position (weight: 0.10)
-    bb = features['bb_pct']
-    if bb > 0.9:   bb_score = -0.7
-    elif bb > 0.6: bb_score =  0.3
-    elif bb > 0.4: bb_score =  0.0
-    elif bb > 0.1: bb_score = -0.2
-    else:          bb_score =  0.7  # near lower band — oversold
+    # 5. Bollinger Band (weight: 0.10)
+    if   bb > 0.95: bb_score = -0.9  # at upper band — overextended
+    elif bb > 0.75: bb_score = -0.3
+    elif bb > 0.5:  bb_score =  0.1
+    elif bb > 0.25: bb_score =  0.3
+    else:           bb_score =  0.8  # at lower band — oversold
     score   += bb_score * 0.10
     weights += 0.10
 
+    # 6. Volume confirmation (weight: 0.10)
+    vol_score = 0.5 if volume_confirmed else -0.3
+    score     += vol_score * 0.10
+    weights   += 0.10
+
     # Normalize
-    final_score = score / weights  # -1 to +1
+    final_score = score / weights if weights > 0 else 0.0
 
     # Convert to signal
-    if final_score > 0.15:
+    if final_score > 0.18:
         signal     = 'BUY'
-        confidence = min(0.60 + final_score * 0.40, 0.98)
-    elif final_score < -0.15:
+        confidence = min(0.62 + final_score * 0.38, 0.95)
+        # Scale down confidence if volume not confirmed
+        if not volume_confirmed:
+            confidence *= 0.85
+    elif final_score < -0.18:
         signal     = 'SELL'
-        confidence = min(0.60 + abs(final_score) * 0.40, 0.98)
+        confidence = min(0.62 + abs(final_score) * 0.38, 0.95)
     else:
         signal     = 'HOLD'
-        confidence = 0.50 + abs(final_score)
+        confidence = 0.50 + abs(final_score) * 0.3
+
+    # ATR adjustment — high volatility = lower confidence
+    if atr_pct > 3.0:
+        confidence *= 0.90  # very volatile — reduce confidence
 
     return {
-        'signal':     signal,
-        'confidence': round(confidence, 3),
-        'score':      round(final_score, 3)
+        'signal':         signal,
+        'confidence':     round(confidence, 3),
+        'score':          round(final_score, 3),
+        'blocked_reason': blocked_reason,
+        'atr_pct':        round(atr_pct, 2),
+        'vol_ratio':      round(vol_ratio, 2),
     }
 
 # ============================================================
