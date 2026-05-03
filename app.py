@@ -498,6 +498,113 @@ def get_iv_rank() -> float:
 # ============================================================
 # API ROUTES
 # ============================================================
+
+# ============================================================
+# MULTI-TIMEFRAME ANALYSIS — 4h + daily confirmation
+# ============================================================
+def get_4h_features(ticker: str) -> dict:
+    """Get 4-hour timeframe features for confirmation."""
+    try:
+        df = yf.download(ticker, period='30d', interval='1h', progress=False)
+        if df.empty or len(df) < 20:
+            return None
+
+        c = df['Close'].squeeze()
+        v = df['Volume'].squeeze()
+
+        # 4h candles — resample
+        df_4h = df.resample('4h').agg({
+            'Open': 'first', 'High': 'max',
+            'Low': 'min', 'Close': 'last', 'Volume': 'sum'
+        }).dropna()
+
+        if len(df_4h) < 10:
+            return None
+
+        c4h = df_4h['Close'].squeeze()
+
+        # 4h trend
+        ema9_4h  = float(c4h.ewm(span=9).mean().iloc[-1])
+        ema21_4h = float(c4h.ewm(span=21).mean().iloc[-1])
+        price_4h = float(c4h.iloc[-1])
+
+        # 4h momentum
+        roc3_4h  = (price_4h / float(c4h.iloc[-4]) - 1) * 100 if len(c4h) > 4 else 0
+
+        # 4h RSI
+        delta   = c4h.diff()
+        gain    = delta.clip(lower=0).rolling(14).mean()
+        loss    = (-delta.clip(upper=0)).rolling(14).mean()
+        rs      = gain / (loss + 1e-9)
+        rsi_4h  = float(100 - 100 / (1 + rs.iloc[-1]))
+
+        # Intraday trend — last 1h candles
+        df_1h = df.tail(8)  # last 8 hours
+        c1h   = df_1h['Close'].squeeze()
+        intraday_up = float(c1h.iloc[-1]) > float(c1h.iloc[0])  # trending up today
+
+        return {
+            'price_4h':      round(price_4h, 2),
+            'ema9_4h':       round(ema9_4h, 2),
+            'ema21_4h':      round(ema21_4h, 2),
+            'rsi_4h':        round(rsi_4h, 1),
+            'roc3_4h':       round(roc3_4h, 2),
+            'above_ema9':    price_4h > ema9_4h,
+            'above_ema21':   price_4h > ema21_4h,
+            'ema_bullish':   ema9_4h > ema21_4h,  # fast > slow = bullish
+            'intraday_up':   intraday_up,
+            'intraday_pct':  round((float(c1h.iloc[-1]) / float(c1h.iloc[0]) - 1) * 100, 2) if float(c1h.iloc[0]) > 0 else 0,
+        }
+    except Exception as e:
+        print(f"4h features error {ticker}: {e}")
+        return None
+
+# ============================================================
+# SUPPORT / RESISTANCE LEVELS
+# ============================================================
+def get_support_resistance(ticker: str) -> dict:
+    """Calculate key support/resistance levels using pivot points."""
+    try:
+        df = yf.download(ticker, period='30d', interval='1d', progress=False)
+        if df.empty or len(df) < 10:
+            return {}
+
+        # Use last 5 days for pivot calculation
+        recent = df.tail(5)
+        high   = float(recent['High'].max())
+        low    = float(recent['Low'].min())
+        close  = float(df['Close'].iloc[-1])
+
+        # Classic pivot points
+        pivot = (high + low + close) / 3
+        r1    = 2 * pivot - low
+        r2    = pivot + (high - low)
+        s1    = 2 * pivot - high
+        s2    = pivot - (high - low)
+
+        # Distance to nearest support/resistance
+        dist_r1 = round((r1 - close) / close * 100, 2)
+        dist_s1 = round((close - s1) / close * 100, 2)
+
+        # Is price near support (good entry) or resistance (bad entry)?
+        near_support    = 0 < dist_s1 < 2.0   # within 2% of support
+        near_resistance = 0 < dist_r1 < 1.5   # within 1.5% of resistance
+
+        return {
+            'pivot':           round(pivot, 2),
+            'r1':              round(r1, 2),
+            'r2':              round(r2, 2),
+            's1':              round(s1, 2),
+            's2':              round(s2, 2),
+            'dist_to_r1_pct':  dist_r1,
+            'dist_to_s1_pct':  dist_s1,
+            'near_support':    near_support,
+            'near_resistance': near_resistance,
+        }
+    except Exception as e:
+        print(f"S/R error {ticker}: {e}")
+        return {}
+
 @app.get('/signals')
 def get_signals():
     vix     = get_vix()
@@ -512,20 +619,66 @@ def get_signals():
     for ticker in TICKERS:
         features = get_features(ticker)
         sig      = generate_signal(features)
-        result[ticker] = {
-            'price':      features['price']       if features else 0,
-            'day_change': features['day_change']   if features else 0,
-            'sma20':      features['sma20']        if features else 0,
-            'sma50':      features['sma50']        if features else 0,
-            'sma200':     features['sma200']       if features else 0,
-            'from_ath':   features['from_ath']     if features else 0,
-            'atr':        features['atr']          if features else 0,
-            'atr_pct':    features['atr_pct']      if features else 0,
-            'rsi':        round(features['rsi'],1) if features else 50,
-            'signal':     sig['signal'],
-            'confidence': sig['confidence'],
-            'score':      sig['score'],
+
+        # Multi-timeframe 4h confirmation
+        tf4h = get_4h_features(ticker)
+
+        # Support/resistance levels
+        sr = get_support_resistance(ticker)
+
+        # Combine into final signal
+        ticker_data = {
+            'price':            features['price']       if features else 0,
+            'day_change':       features['day_change']   if features else 0,
+            'sma20':            features['sma20']        if features else 0,
+            'sma50':            features['sma50']        if features else 0,
+            'sma200':           features['sma200']       if features else 0,
+            'from_ath':         features['from_ath']     if features else 0,
+            'atr':              features['atr']          if features else 0,
+            'atr_pct':          features['atr_pct']      if features else 0,
+            'rsi':              round(features['rsi'],1) if features else 50,
+            'gap_pct':          features.get('gap_pct', 0) if features else 0,
+            'signal':           sig['signal'],
+            'confidence':       sig['confidence'],
+            'score':            sig['score'],
+            'blocked_reason':   sig.get('blocked_reason'),
+            'vol_ratio':        sig.get('vol_ratio', 1.0),
+            'first_30min':      sig.get('first_30min', False),
+            'last_30min':       sig.get('last_30min', False),
+            # 4h timeframe
+            '4h':               tf4h or {},
+            # Support/resistance
+            'sr':               sr,
         }
+
+        # Adjust confidence based on 4h confirmation
+        if tf4h:
+            daily_bull  = sig['signal'] == 'BUY'
+            h4_bull     = tf4h['ema_bullish'] and tf4h['above_ema9']
+            intraday_up = tf4h['intraday_up']
+
+            if daily_bull and h4_bull and intraday_up:
+                # All timeframes aligned — boost confidence
+                ticker_data['confidence'] = min(sig['confidence'] * 1.10, 0.95)
+                ticker_data['tf_aligned'] = True
+            elif daily_bull and not h4_bull:
+                # Daily says BUY but 4h disagrees — reduce confidence
+                ticker_data['confidence'] = sig['confidence'] * 0.80
+                ticker_data['tf_aligned'] = False
+            else:
+                ticker_data['tf_aligned'] = None
+
+        # Adjust for resistance — reduce confidence if near resistance
+        if sr.get('near_resistance', False):
+            ticker_data['confidence'] = round(ticker_data['confidence'] * 0.85, 3)
+            ticker_data['sr_warning'] = 'NEAR_RESISTANCE'
+        elif sr.get('near_support', False):
+            ticker_data['confidence'] = round(ticker_data['confidence'] * 1.05, 3)
+            ticker_data['sr_warning'] = 'NEAR_SUPPORT_GOOD_ENTRY'
+        else:
+            ticker_data['sr_warning'] = None
+
+        result[ticker] = ticker_data
 
     # Market regime
     bull_count = sum(1 for t in TICKERS if result.get(t, {}).get('signal') == 'BUY')
@@ -591,6 +744,131 @@ def retrain_endpoint(data: dict):
         return JSONResponse({'status': 'success', 'ticker': ticker, 'accuracy': round(acc,3), 'samples': len(outcomes)})
     except Exception as e:
         return JSONResponse({'status': 'error', 'message': str(e)})
+
+
+# ============================================================
+# BACKTESTING FRAMEWORK — test strategy on historical data
+# ============================================================
+@app.get('/backtest/{ticker}')
+def backtest(ticker: str, days: int = 90):
+    """
+    Simple backtest: simulate buy/sell signals on last N days.
+    Returns win rate, total return, max drawdown.
+    """
+    try:
+        df = yf.download(ticker, period=f'{days+50}d', interval='1d', progress=False)
+        if df.empty or len(df) < 50:
+            return JSONResponse({'error': 'Insufficient data'})
+
+        c = df['Close'].squeeze()
+        h = df['High'].squeeze()
+        l = df['Low'].squeeze()
+        v = df['Volume'].squeeze()
+
+        trades      = []
+        in_position = False
+        entry_price = 0
+        equity      = 10000.0
+        peak_equity = 10000.0
+        max_dd      = 0.0
+
+        for i in range(50, len(c) - 1):
+            # Build features for this day
+            window = c.iloc[i-50:i+1]
+            rsi_val = compute_rsi(window, 14)
+            sma20   = float(window.rolling(20).mean().iloc[-1])
+            sma50   = float(window.rolling(50).mean().iloc[-1]) if i >= 50 else sma20
+            price   = float(c.iloc[i])
+            vol_r   = float(v.iloc[i]) / float(v.iloc[i-20:i].mean()) if i >= 20 else 1.0
+
+            features = {
+                'rsi':        rsi_val,
+                'above_sma20': 1 if price > sma20 else 0,
+                'above_sma50': 1 if price > sma50 else 0,
+                'macd':        float((window.ewm(span=12).mean() - window.ewm(span=26).mean()).iloc[-1]),
+                'macd_signal': float((window.ewm(span=12).mean() - window.ewm(span=26).mean()).ewm(span=9).mean().iloc[-1]),
+                'roc5':        float((price / float(c.iloc[i-5]) - 1) * 100) if i >= 5 else 0,
+                'roc10':       float((price / float(c.iloc[i-10]) - 1) * 100) if i >= 10 else 0,
+                'roc20':       float((price / float(c.iloc[i-20]) - 1) * 100) if i >= 20 else 0,
+                'bb_pct':      0.5,
+                'vol_ratio':   vol_r,
+                'atr_pct':     float(compute_atr(h.iloc[i-14:i+1], l.iloc[i-14:i+1], c.iloc[i-14:i+1], 14) / price * 100) if i >= 14 else 1.5,
+                'gap_down':    False,
+                'gap_pct':     0,
+            }
+
+            sig = generate_signal(features)
+
+            if not in_position and sig['signal'] == 'BUY' and sig['confidence'] >= 0.65:
+                # Dynamic SL based on ATR
+                atr_pct   = features['atr_pct'] / 100
+                stop_loss = price * (1 - max(atr_pct * 2, 0.05))
+                take_prof = price * 1.14  # 14% TP (2:1 ratio)
+                entry_price = price
+                in_position = True
+                entry_idx   = i
+
+            elif in_position:
+                next_price = float(c.iloc[i+1])
+                pnl_pct    = (next_price - entry_price) / entry_price
+
+                # Exit conditions
+                exit_reason = None
+                if next_price <= entry_price * 0.93:  # -7% SL
+                    exit_reason = 'STOP_LOSS'
+                elif next_price >= entry_price * 1.14:  # +14% TP
+                    exit_reason = 'TAKE_PROFIT'
+                elif sig['signal'] == 'SELL' and sig['confidence'] >= 0.75:
+                    exit_reason = 'SIGNAL_EXIT'
+                elif i - entry_idx >= 20:  # max hold 20 days
+                    exit_reason = 'MAX_HOLD'
+
+                if exit_reason:
+                    pnl_pct  = (next_price - entry_price) / entry_price
+                    pnl_usd  = equity * pnl_pct
+                    equity  += pnl_usd
+                    peak_equity = max(peak_equity, equity)
+                    drawdown    = (peak_equity - equity) / peak_equity
+                    max_dd      = max(max_dd, drawdown)
+
+                    trades.append({
+                        'date':        str(df.index[i+1])[:10],
+                        'entry':       round(entry_price, 2),
+                        'exit':        round(next_price, 2),
+                        'pnl_pct':     round(pnl_pct * 100, 2),
+                        'reason':      exit_reason,
+                        'result':      'WIN' if pnl_pct > 0 else 'LOSS',
+                    })
+                    in_position = False
+
+        if not trades:
+            return JSONResponse({'error': 'No trades generated', 'ticker': ticker})
+
+        wins        = [t for t in trades if t['result'] == 'WIN']
+        losses      = [t for t in trades if t['result'] == 'LOSS']
+        win_rate    = len(wins) / len(trades) * 100
+        total_ret   = (equity - 10000) / 10000 * 100
+        avg_win     = sum(t['pnl_pct'] for t in wins)   / len(wins)   if wins   else 0
+        avg_loss    = sum(t['pnl_pct'] for t in losses) / len(losses) if losses else 0
+        profit_factor = abs(avg_win * len(wins)) / abs(avg_loss * len(losses)) if losses and avg_loss != 0 else 0
+
+        return JSONResponse({
+            'ticker':        ticker,
+            'period_days':   days,
+            'total_trades':  len(trades),
+            'wins':          len(wins),
+            'losses':        len(losses),
+            'win_rate_pct':  round(win_rate, 1),
+            'total_return_pct': round(total_ret, 2),
+            'avg_win_pct':   round(avg_win, 2),
+            'avg_loss_pct':  round(avg_loss, 2),
+            'profit_factor': round(profit_factor, 2),
+            'max_drawdown_pct': round(max_dd * 100, 2),
+            'final_equity':  round(equity, 2),
+            'recent_trades': trades[-5:],
+        })
+    except Exception as e:
+        return JSONResponse({'error': str(e), 'ticker': ticker})
 
 @app.get('/health')
 def health():
