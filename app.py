@@ -829,11 +829,17 @@ def get_regime_weights(regime: str) -> dict:
 # BUILD 6: SHARPE RATIO CALCULATION
 # ============================================================
 def calculate_sharpe(ticker: str, days: int = 90) -> dict:
-    """Calculate Sharpe ratio for a ticker over N days."""
+    """
+    Calculate Sharpe, Sortino, and Calmar ratios for a ticker.
+    - Sharpe:  total risk-adjusted return
+    - Sortino: downside risk only (better for asymmetric strategies)
+    - Calmar:  return / max drawdown (resilience measure)
+    """
     try:
         df      = yf.download(ticker, period=f'{days}d', interval='1d', progress=False)
         if df.empty or len(df) < 20:
-            return {'sharpe': None, 'annualized_return': None, 'volatility': None}
+            return {'sharpe': None, 'sortino': None, 'calmar': None,
+                    'annualized_return': None, 'volatility': None}
 
         c       = df['Close'].squeeze()
         returns = c.pct_change().dropna()
@@ -841,19 +847,48 @@ def calculate_sharpe(ticker: str, days: int = 90) -> dict:
         std_r   = float(returns.std())
 
         if std_r == 0:
-            return {'sharpe': 0, 'annualized_return': 0, 'volatility': 0}
+            return {'sharpe': 0, 'sortino': 0, 'calmar': 0,
+                    'annualized_return': 0, 'volatility': 0}
 
-        risk_free_daily = 0.045 / 252  # 4.5% annual risk-free rate
+        risk_free_daily = 0.045 / 252
+
+        # Sharpe ratio
         sharpe = (mean_r - risk_free_daily) / std_r * (252 ** 0.5)
 
+        # Sortino ratio — only penalizes downside volatility
+        downside = returns[returns < risk_free_daily] - risk_free_daily
+        downside_std = float(downside.std()) if len(downside) > 0 else std_r
+        sortino = (mean_r - risk_free_daily) / downside_std * (252 ** 0.5) if downside_std > 0 else 0
+
+        # Calmar ratio — annualized return / max drawdown
+        cumulative  = (1 + returns).cumprod()
+        rolling_max = cumulative.cummax()
+        drawdowns   = (cumulative - rolling_max) / rolling_max
+        max_dd      = float(abs(drawdowns.min()))
+        ann_return  = mean_r * 252
+        calmar      = ann_return / max_dd if max_dd > 0 else 0
+
+        # Rating
+        def rate(sharpe):
+            if sharpe >= 2.0: return 'Excellent'
+            if sharpe >= 1.5: return 'Good'
+            if sharpe >= 1.0: return 'Acceptable'
+            return 'Poor'
+
         return {
-            'sharpe':            round(sharpe, 2),
-            'annualized_return': round(mean_r * 252 * 100, 2),
-            'volatility':        round(std_r * (252 ** 0.5) * 100, 2),
-            'ticker':            ticker,
+            'ticker':             ticker,
+            'sharpe':             round(sharpe, 2),
+            'sortino':            round(sortino, 2),
+            'calmar':             round(calmar, 2),
+            'annualized_return':  round(ann_return * 100, 2),
+            'volatility':         round(std_r * (252 ** 0.5) * 100, 2),
+            'max_drawdown_pct':   round(max_dd * 100, 2),
+            'rating':             rate(sharpe),
+            'days':               days,
         }
     except Exception as e:
-        return {'sharpe': None, 'annualized_return': None, 'volatility': None}
+        return {'sharpe': None, 'sortino': None, 'calmar': None,
+                'annualized_return': None, 'volatility': None, 'error': str(e)}
 
 @app.get('/signals')
 def get_signals():
@@ -1169,6 +1204,111 @@ def backtest(ticker: str, days: int = 180):
             'max_drawdown_pct': round(max_dd * 100, 2),
             'final_equity':  round(equity, 2),
             'recent_trades': trades[-5:],
+        })
+    except Exception as e:
+        return JSONResponse({'error': str(e), 'ticker': ticker})
+
+@app.get('/walkforward/{ticker}')
+def walkforward(ticker: str, windows: int = 6):
+    """
+    Walk-forward backtest: splits 180 days into rolling windows.
+    Each window: 30 days train (signal calibration) + 15 days test.
+    Returns consistency score — how stable is the strategy across periods.
+    """
+    try:
+        df = yf.download(ticker, period='200d', interval='1d', progress=False)
+        if df.empty or len(df) < 60:
+            return JSONResponse({'error': 'Insufficient data', 'ticker': ticker})
+
+        c = df['Close'].squeeze()
+        h = df['High'].squeeze()
+        l = df['Low'].squeeze()
+        v = df['Volume'].squeeze()
+
+        window_size = 30  # train window
+        test_size   = 15  # test window
+        results     = []
+
+        for w in range(windows):
+            train_start = w * test_size
+            train_end   = train_start + window_size
+            test_end    = train_end + test_size
+
+            if test_end > len(c):
+                break
+
+            test_c = c.iloc[train_end:test_end]
+            test_h = h.iloc[train_end:test_end]
+            test_l = l.iloc[train_end:test_end]
+            test_v = v.iloc[train_end:test_end]
+
+            # Simulate strategy on test window
+            trades     = []
+            in_pos     = False
+            entry_px   = 0
+            entry_idx  = 0
+
+            for i in range(5, len(test_c) - 1):
+                window_data = c.iloc[train_start:train_end+i]
+                rsi_val = compute_rsi(window_data, 14)
+                sma20   = float(window_data.rolling(20).mean().iloc[-1]) if len(window_data) >= 20 else float(window_data.mean())
+                price   = float(test_c.iloc[i])
+                vol_r   = float(test_v.iloc[i]) / float(test_v.iloc[max(0,i-10):i].mean()) if i >= 10 else 1.0
+
+                features = {
+                    'rsi': rsi_val, 'above_sma20': 1 if price > sma20 else 0,
+                    'above_sma50': 1 if price > sma20 else 0,
+                    'macd': 0.1, 'macd_signal': 0.0,
+                    'roc5': float((price/float(test_c.iloc[max(0,i-5)])-1)*100),
+                    'roc10': float((price/float(test_c.iloc[max(0,i-10)])-1)*100),
+                    'roc20': 0, 'bb_pct': 0.5,
+                    'vol_ratio': vol_r, 'atr_pct': 1.5,
+                    'gap_down': False, 'gap_pct': 0,
+                }
+                sig = generate_signal(features)
+
+                if not in_pos and sig['signal'] == 'BUY' and sig['confidence'] >= 0.72:
+                    in_pos    = True
+                    entry_px  = price
+                    entry_idx = i
+                elif in_pos:
+                    pnl = (price - entry_px) / entry_px
+                    if pnl <= -0.07 or pnl >= 0.14 or (i - entry_idx) >= 15:
+                        trades.append({
+                            'pnl':    round(pnl * 100, 2),
+                            'result': 'WIN' if pnl > 0 else 'LOSS',
+                        })
+                        in_pos = False
+
+            if trades:
+                wins    = len([t for t in trades if t['result'] == 'WIN'])
+                wr      = wins / len(trades) * 100
+                avg_pnl = sum(t['pnl'] for t in trades) / len(trades)
+                results.append({
+                    'window':    w + 1,
+                    'trades':    len(trades),
+                    'win_rate':  round(wr, 1),
+                    'avg_pnl':   round(avg_pnl, 2),
+                    'profitable': avg_pnl > 0,
+                })
+
+        if not results:
+            return JSONResponse({'error': 'No trades in any window', 'ticker': ticker})
+
+        # Consistency score — % of windows that were profitable
+        profitable_windows = sum(1 for r in results if r['profitable'])
+        consistency = round(profitable_windows / len(results) * 100, 1)
+        avg_wr      = round(sum(r['win_rate'] for r in results) / len(results), 1)
+        avg_pnl     = round(sum(r['avg_pnl'] for r in results) / len(results), 2)
+
+        return JSONResponse({
+            'ticker':       ticker,
+            'windows':      len(results),
+            'consistency':  consistency,
+            'avg_win_rate': avg_wr,
+            'avg_pnl':      avg_pnl,
+            'verdict':      'ROBUST' if consistency >= 70 else 'MODERATE' if consistency >= 50 else 'UNSTABLE',
+            'window_results': results,
         })
     except Exception as e:
         return JSONResponse({'error': str(e), 'ticker': ticker})
