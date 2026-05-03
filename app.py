@@ -4,6 +4,7 @@
 # Returns: direction, confidence, regime, options signals
 # ============================================================
 
+# requirements.txt: add scikit-learn pytz
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 import numpy as np
@@ -297,6 +298,9 @@ def get_features(ticker: str) -> dict:
         'above_sma20':    above_sma20,
         'above_sma50':    above_sma50,
         'pct_from_sma20': float(pct_from_sma20),
+        'gap_pct':        round((price / prev_close - 1) * 100, 2) if prev_close > 0 else 0.0,
+        'gap_down':       (price / prev_close - 1) * 100 < -2.0 if prev_close > 0 else False,
+        'gap_up':         (price / prev_close - 1) * 100 > 2.0  if prev_close > 0 else False,
     }
 
 def compute_rsi(close, period=14):
@@ -331,6 +335,15 @@ def generate_signal(features: dict) -> dict:
     if not features:
         return {'signal': 'HOLD', 'confidence': 0.5, 'score': 0.0,
                 'blocked_reason': 'no_data', 'atr_pct': 0, 'vol_ratio': 1.0}
+
+    # FIX 1: Block BUY on overnight gap down > 2%
+    if features.get('gap_down', False):
+        gap = features.get('gap_pct', 0)
+        return {'signal': 'HOLD', 'confidence': 0.55, 'score': -0.2,
+                'blocked_reason': f'GAP_DOWN_{gap:.1f}pct',
+                'atr_pct': features.get('atr_pct', 1.5),
+                'vol_ratio': features.get('vol_ratio', 1.0),
+                'gap_pct': gap}
 
     score   = 0.0
     weights = 0.0
@@ -437,6 +450,19 @@ def generate_signal(features: dict) -> dict:
     if atr_pct > 3.0:
         confidence *= 0.90  # very volatile — reduce confidence
 
+    # FIX 2: Reduce confidence first/last 30min (volatile periods)
+    try:
+        from datetime import datetime as dt2
+        import pytz
+        est     = dt2.now(pytz.timezone('America/New_York'))
+        first30 = est.hour == 9 and 30 <= est.minute < 60
+        last30  = est.hour == 15 and est.minute >= 30
+        if first30: confidence = round(confidence * 0.85, 3)
+        if last30:  confidence = round(confidence * 0.90, 3)
+    except:
+        first30 = False
+        last30  = False
+
     return {
         'signal':         signal,
         'confidence':     round(confidence, 3),
@@ -444,6 +470,9 @@ def generate_signal(features: dict) -> dict:
         'blocked_reason': blocked_reason,
         'atr_pct':        round(atr_pct, 2),
         'vol_ratio':      round(vol_ratio, 2),
+        'gap_pct':        features.get('gap_pct', 0),
+        'first_30min':    first30,
+        'last_30min':     last30,
     }
 
 # ============================================================
@@ -544,6 +573,24 @@ def news_endpoint():
 def macro_endpoint():
     """Macro market context."""
     return JSONResponse(get_macro_context())
+
+@app.post('/retrain')
+def retrain_endpoint(data: dict):
+    ticker   = data.get('ticker', 'NVDA')
+    outcomes = data.get('outcomes', [])
+    if len(outcomes) < 10:
+        return JSONResponse({'status': 'insufficient_data', 'count': len(outcomes)})
+    try:
+        keys = ['rsi','macd','roc5','roc10','roc20','bb_pct','vol_ratio','above_sma20','above_sma50','atr_pct']
+        X = [[float(o.get('features',{}).get(k,0)) for k in keys] for o in outcomes]
+        y = [1 if o.get('result')=='WIN' else 0 for o in outcomes]
+        model = xgb.XGBClassifier(n_estimators=100, max_depth=4, learning_rate=0.1, eval_metric='logloss', use_label_encoder=False)
+        model.fit(X, y)
+        from sklearn.metrics import accuracy_score
+        acc = accuracy_score(y, model.predict(X))
+        return JSONResponse({'status': 'success', 'ticker': ticker, 'accuracy': round(acc,3), 'samples': len(outcomes)})
+    except Exception as e:
+        return JSONResponse({'status': 'error', 'message': str(e)})
 
 @app.get('/health')
 def health():
