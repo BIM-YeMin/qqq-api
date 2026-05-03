@@ -605,6 +605,256 @@ def get_support_resistance(ticker: str) -> dict:
         print(f"S/R error {ticker}: {e}")
         return {}
 
+
+# ============================================================
+# BUILD 1: FinBERT SENTIMENT — replaces keyword matching
+# Uses ProsusAI/finbert from HuggingFace
+# ============================================================
+_finbert_model     = None
+_finbert_tokenizer = None
+_finbert_cache     = {}
+_finbert_cache_time = {}
+
+def load_finbert():
+    global _finbert_model, _finbert_tokenizer
+    if _finbert_model is None:
+        try:
+            from transformers import AutoTokenizer, AutoModelForSequenceClassification
+            import torch
+            print("Loading FinBERT model...")
+            _finbert_tokenizer = AutoTokenizer.from_pretrained("ProsusAI/finbert")
+            _finbert_model     = AutoModelForSequenceClassification.from_pretrained("ProsusAI/finbert")
+            _finbert_model.eval()
+            print("FinBERT loaded successfully")
+        except Exception as e:
+            print(f"FinBERT load error: {e}")
+            _finbert_model = None
+    return _finbert_model is not None
+
+def finbert_score(texts: list) -> float:
+    """Score a list of headlines using FinBERT. Returns -1 to +1."""
+    if not texts or not load_finbert():
+        return 0.0
+    try:
+        import torch
+        scores = []
+        for text in texts[:5]:  # max 5 headlines
+            inputs = _finbert_tokenizer(
+                text[:512], return_tensors='pt',
+                truncation=True, max_length=512
+            )
+            with torch.no_grad():
+                outputs = _finbert_model(**inputs)
+            probs = torch.nn.functional.softmax(outputs.logits, dim=-1)[0]
+            # FinBERT labels: 0=positive, 1=negative, 2=neutral
+            pos  = float(probs[0])
+            neg  = float(probs[1])
+            neut = float(probs[2])
+            score = pos - neg  # -1 to +1
+            scores.append(score)
+        return round(sum(scores) / len(scores), 3) if scores else 0.0
+    except Exception as e:
+        print(f"FinBERT scoring error: {e}")
+        return 0.0
+
+def get_finbert_sentiment(ticker: str) -> dict:
+    """Get FinBERT-powered sentiment for a ticker."""
+    now = datetime.utcnow()
+
+    # Check cache (2 hour TTL)
+    if ticker in _finbert_cache:
+        age = (now - _finbert_cache_time[ticker]).total_seconds() / 3600
+        if age < 2:
+            return _finbert_cache[ticker]
+
+    try:
+        stock    = yf.Ticker(ticker)
+        news     = stock.news or []
+        cutoff   = now - timedelta(hours=48)
+        headlines = []
+
+        for article in news[:10]:
+            title    = article.get('title', '')
+            pub_time = article.get('providerPublishTime', 0)
+            if not title: continue
+            if pub_time and datetime.utcfromtimestamp(pub_time) < cutoff: continue
+            headlines.append(title)
+
+        if not headlines:
+            result = {'ticker': ticker, 'sentiment': 0.0, 'signal': 'NEUTRAL',
+                      'method': 'finbert', 'headlines': [], 'count': 0}
+        else:
+            score = finbert_score(headlines)
+            signal = 'BULLISH' if score > 0.15 else 'BEARISH' if score < -0.15 else 'NEUTRAL'
+            result = {
+                'ticker':    ticker,
+                'sentiment': score,
+                'signal':    signal,
+                'method':    'finbert',
+                'headlines': headlines[:3],
+                'count':     len(headlines),
+            }
+
+        _finbert_cache[ticker]      = result
+        _finbert_cache_time[ticker] = now
+        return result
+
+    except Exception as e:
+        print(f"FinBERT sentiment error {ticker}: {e}")
+        return {'ticker': ticker, 'sentiment': 0.0, 'signal': 'NEUTRAL', 'method': 'error', 'headlines': [], 'count': 0}
+
+# ============================================================
+# BUILD 2: VWAP CALCULATION
+# ============================================================
+def get_vwap(ticker: str) -> dict:
+    """Calculate intraday VWAP and position relative to it."""
+    try:
+        df = yf.download(ticker, period='1d', interval='5m', progress=False)
+        if df.empty or len(df) < 5:
+            return {'vwap': None, 'price_vs_vwap': None, 'above_vwap': None}
+
+        typical_price = (df['High'] + df['Low'] + df['Close']) / 3
+        cum_vol       = df['Volume'].cumsum()
+        cum_tp_vol    = (typical_price * df['Volume']).cumsum()
+        vwap          = cum_tp_vol / cum_vol
+
+        current_vwap  = float(vwap.iloc[-1])
+        current_price = float(df['Close'].iloc[-1])
+        pct_vs_vwap   = round((current_price / current_vwap - 1) * 100, 2)
+        above_vwap    = current_price > current_vwap
+
+        return {
+            'vwap':          round(current_vwap, 2),
+            'price_vs_vwap': pct_vs_vwap,
+            'above_vwap':    above_vwap,
+        }
+    except Exception as e:
+        return {'vwap': None, 'price_vs_vwap': None, 'above_vwap': None}
+
+# ============================================================
+# BUILD 3: POST-EARNINGS MOMENTUM DETECTION
+# ============================================================
+def get_earnings_momentum(ticker: str) -> dict:
+    """
+    Detect post-earnings drift opportunity.
+    If earnings was within last 5 days AND price gapped up → BUY momentum.
+    """
+    try:
+        stock    = yf.Ticker(ticker)
+        cal      = stock.calendar
+        today    = datetime.utcnow().date()
+
+        if cal is None or cal.empty:
+            return {'post_earnings': False, 'earnings_gap': 0, 'days_since': None}
+
+        dates = cal.columns.tolist()
+        if not dates:
+            return {'post_earnings': False, 'earnings_gap': 0, 'days_since': None}
+
+        earn_date = dates[0]
+        if hasattr(earn_date, 'date'):
+            earn_date = earn_date.date()
+        else:
+            earn_date = datetime.strptime(str(earn_date)[:10], '%Y-%m-%d').date()
+
+        days_since = (today - earn_date).days
+
+        if 0 <= days_since <= 5:
+            # Recent earnings — check for gap up
+            df = yf.download(ticker, period='10d', interval='1d', progress=False)
+            if len(df) >= 2:
+                c  = df['Close'].squeeze()
+                o  = df['Open'].squeeze()
+                gap = float((float(o.iloc[-1]) / float(c.iloc[-2]) - 1) * 100)
+                return {
+                    'post_earnings': True,
+                    'earnings_gap':  round(gap, 2),
+                    'days_since':    days_since,
+                    'bullish_drift': gap > 2.0,  # gap up > 2% = strong buy momentum
+                }
+
+        return {'post_earnings': False, 'earnings_gap': 0, 'days_since': days_since}
+
+    except Exception as e:
+        return {'post_earnings': False, 'earnings_gap': 0, 'days_since': None}
+
+# ============================================================
+# BUILD 5: 52-WEEK HIGH BREAKOUT DETECTION
+# ============================================================
+def get_breakout_signal(ticker: str, features: dict) -> dict:
+    """Detect 52-week high breakout — strong momentum signal."""
+    try:
+        if not features:
+            return {'breakout': False, 'pct_from_52wk_high': 0}
+
+        price   = features.get('price', 0)
+        ath     = features.get('ath', price)
+        pct_off = features.get('from_ath', 0)
+
+        # Near 52-week high (within 3%) = breakout candidate
+        near_high = pct_off >= -3.0 and pct_off <= 0
+
+        # Already broke out (new high)
+        new_high  = pct_off >= 0
+
+        return {
+            'breakout':            new_high,
+            'near_breakout':       near_high,
+            'pct_from_52wk_high':  pct_off,
+        }
+    except:
+        return {'breakout': False, 'near_breakout': False, 'pct_from_52wk_high': 0}
+
+# ============================================================
+# BUILD 4: REGIME-SPECIFIC SIGNAL WEIGHTS
+# Based on research: scale signals differently per regime
+# ============================================================
+def get_regime_weights(regime: str) -> dict:
+    """
+    Return signal weights and position size multiplier per regime.
+    Based on: strong-trend 1.5x momentum, sideways 1.2x mean-reversion,
+    breakout 2.5x size, high-vol 0.7x size.
+    """
+    weights = {
+        'BULL_LOW_VOL':  {'momentum_scale': 1.5, 'size_mult': 1.3, 'min_conf': 0.68},
+        'BULL_MID_VOL':  {'momentum_scale': 1.2, 'size_mult': 1.0, 'min_conf': 0.72},
+        'SIDEWAYS':      {'momentum_scale': 0.8, 'size_mult': 0.7, 'min_conf': 0.75},
+        'BEAR_MID_VOL':  {'momentum_scale': 0.5, 'size_mult': 0.5, 'min_conf': 0.80},
+        'HIGH_FEAR':     {'momentum_scale': 0.3, 'size_mult': 0.3, 'min_conf': 0.85},
+        'BREAKOUT':      {'momentum_scale': 2.0, 'size_mult': 1.5, 'min_conf': 0.70},
+    }
+    return weights.get(regime, {'momentum_scale': 1.0, 'size_mult': 1.0, 'min_conf': 0.72})
+
+# ============================================================
+# BUILD 6: SHARPE RATIO CALCULATION
+# ============================================================
+def calculate_sharpe(ticker: str, days: int = 90) -> dict:
+    """Calculate Sharpe ratio for a ticker over N days."""
+    try:
+        df      = yf.download(ticker, period=f'{days}d', interval='1d', progress=False)
+        if df.empty or len(df) < 20:
+            return {'sharpe': None, 'annualized_return': None, 'volatility': None}
+
+        c       = df['Close'].squeeze()
+        returns = c.pct_change().dropna()
+        mean_r  = float(returns.mean())
+        std_r   = float(returns.std())
+
+        if std_r == 0:
+            return {'sharpe': 0, 'annualized_return': 0, 'volatility': 0}
+
+        risk_free_daily = 0.045 / 252  # 4.5% annual risk-free rate
+        sharpe = (mean_r - risk_free_daily) / std_r * (252 ** 0.5)
+
+        return {
+            'sharpe':            round(sharpe, 2),
+            'annualized_return': round(mean_r * 252 * 100, 2),
+            'volatility':        round(std_r * (252 ** 0.5) * 100, 2),
+            'ticker':            ticker,
+        }
+    except Exception as e:
+        return {'sharpe': None, 'annualized_return': None, 'volatility': None}
+
 @app.get('/signals')
 def get_signals():
     vix     = get_vix()
@@ -678,6 +928,47 @@ def get_signals():
         else:
             ticker_data['sr_warning'] = None
 
+        # BUILD 1: FinBERT sentiment (replaces keyword matching)
+        finbert_data = get_finbert_sentiment(ticker)
+
+        # BUILD 2: VWAP
+        vwap_data = get_vwap(ticker)
+
+        # BUILD 3: Post-earnings momentum
+        earn_mom = get_earnings_momentum(ticker)
+
+        # BUILD 5: Breakout signal
+        breakout = get_breakout_signal(ticker, features)
+
+        # Enhance confidence with FinBERT
+        if finbert_data['signal'] == 'BULLISH' and ticker_data['signal'] == 'BUY':
+            ticker_data['confidence'] = min(ticker_data['confidence'] * 1.12, 0.95)
+        elif finbert_data['signal'] == 'BEARISH' and ticker_data['signal'] == 'BUY':
+            ticker_data['confidence'] *= 0.80  # reduce on bad news
+            if ticker_data['confidence'] < 0.72:
+                ticker_data['signal'] = 'HOLD'
+
+        # VWAP boost — above VWAP = institutional buying
+        if vwap_data.get('above_vwap') and ticker_data['signal'] == 'BUY':
+            ticker_data['confidence'] = min(ticker_data['confidence'] * 1.05, 0.95)
+
+        # Post-earnings momentum — special boost
+        if earn_mom.get('bullish_drift') and earn_mom.get('post_earnings'):
+            ticker_data['signal']     = 'BUY'
+            ticker_data['confidence'] = min(ticker_data['confidence'] * 1.20, 0.95)
+            ticker_data['post_earnings_play'] = True
+
+        # Breakout boost
+        if breakout.get('breakout') and ticker_data['signal'] == 'BUY':
+            ticker_data['confidence'] = min(ticker_data['confidence'] * 1.10, 0.95)
+            ticker_data['breakout']   = True
+
+        # Add all data to response
+        ticker_data['finbert']         = finbert_data
+        ticker_data['vwap']            = vwap_data
+        ticker_data['earnings_mom']    = earn_mom
+        ticker_data['breakout_signal'] = breakout
+
         result[ticker] = ticker_data
 
     # Market regime
@@ -719,8 +1010,21 @@ def earnings_endpoint():
 
 @app.get('/news')
 def news_endpoint():
-    """News sentiment for all tickers."""
-    return JSONResponse(get_all_news_sentiment())
+    """News sentiment for all tickers using FinBERT."""    results = {}
+    for ticker in TICKERS:
+        results[ticker] = get_finbert_sentiment(ticker)
+    return JSONResponse(results)
+
+@app.get('/sharpe')
+def sharpe_endpoint():
+    """Sharpe ratio for all stock tickers."""    results = {}
+    for ticker in ['NVDA', 'QQQ', 'SPY']:
+        results[ticker] = calculate_sharpe(ticker)
+    return JSONResponse(results)
+
+@app.get('/regime_weights/{regime}')
+def regime_weights_endpoint(regime: str):
+    """Get signal weights for a given market regime."""    return JSONResponse(get_regime_weights(regime))
 
 @app.get('/macro')
 def macro_endpoint():
@@ -750,7 +1054,7 @@ def retrain_endpoint(data: dict):
 # BACKTESTING FRAMEWORK — test strategy on historical data
 # ============================================================
 @app.get('/backtest/{ticker}')
-def backtest(ticker: str, days: int = 90):
+def backtest(ticker: str, days: int = 180):
     """
     Simple backtest: simulate buy/sell signals on last N days.
     Returns win rate, total return, max drawdown.
@@ -820,8 +1124,7 @@ def backtest(ticker: str, days: int = 90):
                     exit_reason = 'TAKE_PROFIT'
                 elif sig['signal'] == 'SELL' and sig['confidence'] >= 0.75:
                     exit_reason = 'SIGNAL_EXIT'
-                elif i - entry_idx >= 20:  # max hold 20 days
-                    exit_reason = 'MAX_HOLD'
+                # MAX_HOLD removed — premature exits hurt performance
 
                 if exit_reason:
                     pnl_pct  = (next_price - entry_price) / entry_price
