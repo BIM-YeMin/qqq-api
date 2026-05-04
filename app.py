@@ -1074,21 +1074,21 @@ def earnings_endpoint():
 
 @app.get('/news')
 def news_endpoint():
-    """News sentiment for all tickers using FinBERT."""    results = {}
+    results = {}
     for ticker in TICKERS:
         results[ticker] = get_finbert_sentiment(ticker)
     return JSONResponse(results)
 
 @app.get('/sharpe')
 def sharpe_endpoint():
-    """Sharpe ratio for all stock tickers."""    results = {}
+    results = {}
     for ticker in ['NVDA', 'QQQ', 'SPY']:
         results[ticker] = calculate_sharpe(ticker)
     return JSONResponse(results)
 
 @app.get('/regime_weights/{regime}')
 def regime_weights_endpoint(regime: str):
-    """Get signal weights for a given market regime."""    return JSONResponse(get_regime_weights(regime))
+    return JSONResponse(get_regime_weights(regime))
 
 @app.get('/macro')
 def macro_endpoint():
