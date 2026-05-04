@@ -6,5 +6,3 @@ pandas
 numpy
 scikit-learn
 pytz
-transformers
-torch
