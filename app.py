@@ -17,7 +17,12 @@ import os
 
 app = FastAPI()
 
+@app.on_event("startup")
+async def startup_event():
+    print("Server started — using enhanced keyword sentiment (lightweight)")
+
 TICKERS = ['QQQ', 'NVDA', 'SPY', 'GLD', 'SLV']
+_signal_cache = {}  # in-memory cache for expensive calls
 
 # ============================================================
 # LIVE EARNINGS CALENDAR — auto-fetched via yfinance
@@ -607,55 +612,47 @@ def get_support_resistance(ticker: str) -> dict:
 
 
 # ============================================================
-# BUILD 1: FinBERT SENTIMENT — replaces keyword matching
-# Uses ProsusAI/finbert from HuggingFace
 # ============================================================
-_finbert_model     = None
-_finbert_tokenizer = None
-_finbert_cache     = {}
+# SENTIMENT — Enhanced keyword scoring (lightweight, no PyTorch)
+# FinBERT removed — too heavy for Railway (needs 2GB RAM)
+# ============================================================
+_finbert_cache      = {}
 _finbert_cache_time = {}
 
-def load_finbert():
-    global _finbert_model, _finbert_tokenizer
-    if _finbert_model is None:
-        try:
-            from transformers import AutoTokenizer, AutoModelForSequenceClassification
-            import torch
-            print("Loading FinBERT model...")
-            _finbert_tokenizer = AutoTokenizer.from_pretrained("ProsusAI/finbert")
-            _finbert_model     = AutoModelForSequenceClassification.from_pretrained("ProsusAI/finbert")
-            _finbert_model.eval()
-            print("FinBERT loaded successfully")
-        except Exception as e:
-            print(f"FinBERT load error: {e}")
-            _finbert_model = None
-    return _finbert_model is not None
+BULLISH_WORDS = ['beat','surge','strong','rally','upgrade','bullish','record','growth','positive','profit','rise','gain']
+BEARISH_WORDS = ['miss','drop','fall','downgrade','sell','bearish','loss','decline','weak','concern','tariff','crash']
+
+def keyword_sentiment(headlines, ticker):
+    if not headlines: return 0.0
+    score = 0.0
+    ticker_lower = ticker.lower()
+    for h in headlines:
+        h = h.lower()
+        relevant = ticker_lower in h or any(k in h for k in ['stock','market','shares','earnings'])
+        weight = 1.5 if relevant else 1.0
+        for w in BULLISH_WORDS:
+            if w in h: score += 0.2 * weight
+        for w in BEARISH_WORDS:
+            if w in h: score -= 0.2 * weight
+    return round(max(-1.0, min(1.0, score / max(len(headlines), 1))), 3)
+
 
 def finbert_score(texts: list) -> float:
-    """Score a list of headlines using FinBERT. Returns -1 to +1."""
-    if not texts or not load_finbert():
-        return 0.0
-    try:
-        import torch
-        scores = []
-        for text in texts[:5]:  # max 5 headlines
-            inputs = _finbert_tokenizer(
-                text[:512], return_tensors='pt',
-                truncation=True, max_length=512
-            )
-            with torch.no_grad():
-                outputs = _finbert_model(**inputs)
-            probs = torch.nn.functional.softmax(outputs.logits, dim=-1)[0]
-            # FinBERT labels: 0=positive, 1=negative, 2=neutral
-            pos  = float(probs[0])
-            neg  = float(probs[1])
-            neut = float(probs[2])
-            score = pos - neg  # -1 to +1
-            scores.append(score)
-        return round(sum(scores) / len(scores), 3) if scores else 0.0
-    except Exception as e:
-        print(f"FinBERT scoring error: {e}")
-        return 0.0
+    # Uses enhanced keyword sentiment — lightweight alternative to FinBERT
+    return keyword_sentiment(texts, '') if texts else 0.0
+
+BULLISH_WORDS = ['beat','surge','strong','rally','upgrade','bullish','record','growth','positive','profit']
+BEARISH_WORDS = ['miss','drop','fall','downgrade','sell','bearish','loss','decline','weak','concern','tariff']
+
+def keyword_sentiment(headlines, ticker):
+    score = 0.0
+    for h in headlines:
+        h = h.lower()
+        for w in BULLISH_WORDS:
+            if w in h: score += 0.2
+        for w in BEARISH_WORDS:
+            if w in h: score -= 0.2
+    return round(max(-1.0, min(1.0, score / max(len(headlines), 1))), 3)
 
 def get_finbert_sentiment(ticker: str) -> dict:
     """Get FinBERT-powered sentiment for a ticker."""
@@ -902,14 +899,27 @@ def get_signals():
     }
 
     for ticker in TICKERS:
-        features = get_features(ticker)
-        sig      = generate_signal(features)
+        try:
+            features = get_features(ticker)
+        except:
+            features = None
+        sig = generate_signal(features)
 
-        # Multi-timeframe 4h confirmation
-        tf4h = get_4h_features(ticker)
+        # Multi-timeframe 4h — use cached if available (refresh every 30min)
+        cache_key = f'tf4h_{ticker}'
+        tf4h = _signal_cache.get(cache_key, {}).get('data')
+        if tf4h is None or (datetime.utcnow() - _signal_cache.get(cache_key, {}).get('time', datetime.min)).seconds > 1800:
+            try: tf4h = get_4h_features(ticker)
+            except: tf4h = {}
+            _signal_cache[cache_key] = {'data': tf4h, 'time': datetime.utcnow()}
 
-        # Support/resistance levels
-        sr = get_support_resistance(ticker)
+        # Support/resistance — cache 1 hour
+        sr_key = f'sr_{ticker}'
+        sr = _signal_cache.get(sr_key, {}).get('data')
+        if sr is None or (datetime.utcnow() - _signal_cache.get(sr_key, {}).get('time', datetime.min)).seconds > 3600:
+            try: sr = get_support_resistance(ticker)
+            except: sr = {}
+            _signal_cache[sr_key] = {'data': sr, 'time': datetime.utcnow()}
 
         # Combine into final signal
         ticker_data = {
@@ -963,17 +973,33 @@ def get_signals():
         else:
             ticker_data['sr_warning'] = None
 
-        # BUILD 1: FinBERT sentiment (replaces keyword matching)
-        finbert_data = get_finbert_sentiment(ticker)
+        # BUILD 1: FinBERT sentiment — cached 2 hours
+        fb_key = f'finbert_{ticker}'
+        finbert_data = _signal_cache.get(fb_key, {}).get('data')
+        if finbert_data is None or (datetime.utcnow() - _signal_cache.get(fb_key, {}).get('time', datetime.min)).seconds > 7200:
+            try: finbert_data = get_finbert_sentiment(ticker)
+            except: finbert_data = {'ticker': ticker, 'sentiment': 0.0, 'signal': 'NEUTRAL'}
+            _signal_cache[fb_key] = {'data': finbert_data, 'time': datetime.utcnow()}
 
-        # BUILD 2: VWAP
-        vwap_data = get_vwap(ticker)
+        # BUILD 2: VWAP — cached 5 minutes
+        vw_key = f'vwap_{ticker}'
+        vwap_data = _signal_cache.get(vw_key, {}).get('data')
+        if vwap_data is None or (datetime.utcnow() - _signal_cache.get(vw_key, {}).get('time', datetime.min)).seconds > 300:
+            try: vwap_data = get_vwap(ticker)
+            except: vwap_data = {}
+            _signal_cache[vw_key] = {'data': vwap_data, 'time': datetime.utcnow()}
 
-        # BUILD 3: Post-earnings momentum
-        earn_mom = get_earnings_momentum(ticker)
+        # BUILD 3: Post-earnings momentum — cached 6 hours
+        em_key = f'earn_{ticker}'
+        earn_mom = _signal_cache.get(em_key, {}).get('data')
+        if earn_mom is None or (datetime.utcnow() - _signal_cache.get(em_key, {}).get('time', datetime.min)).seconds > 21600:
+            try: earn_mom = get_earnings_momentum(ticker)
+            except: earn_mom = {}
+            _signal_cache[em_key] = {'data': earn_mom, 'time': datetime.utcnow()}
 
         # BUILD 5: Breakout signal
-        breakout = get_breakout_signal(ticker, features)
+        try: breakout = get_breakout_signal(ticker, features)
+        except: breakout = {}
 
         # Enhance confidence with FinBERT
         if finbert_data['signal'] == 'BULLISH' and ticker_data['signal'] == 'BUY':
@@ -1021,20 +1047,23 @@ def get_signals():
     earnings = get_all_earnings()
     result['earnings'] = earnings
 
-    # Add news sentiment (cached — only refresh every 2 hours)
-    try:
-        news_data = get_all_news_sentiment()
-        result['news'] = news_data
-    except Exception as e:
-        result['news'] = {}
-        print(f"News fetch error: {e}")
+    # News — cached 2 hours
+    news_key = 'all_news'
+    news_data = _signal_cache.get(news_key, {}).get('data')
+    if news_data is None or (datetime.utcnow() - _signal_cache.get(news_key, {}).get('time', datetime.min)).seconds > 7200:
+        try: news_data = {t: get_finbert_sentiment(t) for t in TICKERS}
+        except: news_data = {}
+        _signal_cache[news_key] = {'data': news_data, 'time': datetime.utcnow()}
+    result['news'] = news_data
 
-    # Add macro context
-    try:
-        result['macro'] = get_macro_context()
-    except Exception as e:
-        result['macro'] = {}
-        print(f"Macro fetch error: {e}")
+    # Macro — cached 30 minutes
+    macro_key = 'macro'
+    macro_data = _signal_cache.get(macro_key, {}).get('data')
+    if macro_data is None or (datetime.utcnow() - _signal_cache.get(macro_key, {}).get('time', datetime.min)).seconds > 1800:
+        try: macro_data = get_macro_context()
+        except: macro_data = {}
+        _signal_cache[macro_key] = {'data': macro_data, 'time': datetime.utcnow()}
+    result['macro'] = macro_data
 
     return JSONResponse(result)
 
