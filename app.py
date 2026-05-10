@@ -21,7 +21,7 @@ app = FastAPI()
 async def startup_event():
     print("Server started — using enhanced keyword sentiment (lightweight)")
 
-TICKERS = ['QQQ', 'NVDA', 'SPY', 'GLD', 'SLV']
+TICKERS = ['QQQ', 'NVDA', 'SPY', 'GLD', 'SLV', 'AMD', 'TSM', 'MSFT', 'AAPL', 'GOOGL']
 _signal_cache = {}  # in-memory cache for expensive calls
 
 # ============================================================
@@ -37,11 +37,16 @@ CACHE_HOURS = 24
 # Known earnings dates — updated automatically by get_earnings_date()
 # Fallback when all APIs fail
 KNOWN_EARNINGS = {
-    'NVDA': ['2026-05-20', '2026-08-27', '2026-11-19', '2027-02-25'],
-    'QQQ':  [],
-    'SPY':  [],
-    'GLD':  [],
-    'SLV':  [],
+    'NVDA':  ['2026-05-20', '2026-08-27', '2026-11-19', '2027-02-25'],
+    'QQQ':   [],
+    'SPY':   [],
+    'GLD':   [],
+    'SLV':   [],
+    'AMD':   ['2026-07-29', '2026-10-28', '2027-01-28'],
+    'TSM':   ['2026-07-17', '2026-10-16', '2027-01-15'],
+    'MSFT':  ['2026-07-29', '2026-10-28', '2027-01-28'],
+    'AAPL':  ['2026-08-05', '2026-10-28', '2027-01-28'],
+    'GOOGL': ['2026-07-29', '2026-10-28', '2027-01-28'],
 }
 
 def get_earnings_date(ticker: str) -> dict:
@@ -156,11 +161,16 @@ MACRO_KEYWORDS = {
 }
 
 TICKER_KEYWORDS = {
-    'NVDA': ['nvidia','nvda','gpu','ai chip','cuda','blackwell','h100','data center'],
-    'QQQ':  ['nasdaq','tech stocks','qqq','faang','big tech','rates','treasury'],
-    'SPY':  ['s&p','spy','market rally','correction','dow','broad market'],
-    'GLD':  ['gold','inflation','dollar','safe haven','fed','gld'],
-    'SLV':  ['silver','slv','industrial metals','solar','ev'],
+    'NVDA':  ['nvidia','nvda','gpu','ai chip','cuda','blackwell','h100','data center'],
+    'QQQ':   ['nasdaq','tech stocks','qqq','faang','big tech','rates','treasury'],
+    'SPY':   ['s&p','spy','market rally','correction','dow','broad market'],
+    'GLD':   ['gold','inflation','dollar','safe haven','fed','gld'],
+    'SLV':   ['silver','slv','industrial metals','solar','ev'],
+    'AMD':   ['amd','advanced micro','ryzen','radeon','epyc','mi300','mi400'],
+    'TSM':   ['tsmc','taiwan semi','taiwan semiconductor','foundry','chip making'],
+    'MSFT':  ['microsoft','msft','azure','copilot','openai','windows','office'],
+    'AAPL':  ['apple','aapl','iphone','mac','app store','vision pro','tim cook'],
+    'GOOGL': ['google','alphabet','googl','gemini','search','youtube','waymo','cloud'],
 }
 
 def score_headline(headline: str, ticker: str = None) -> float:
