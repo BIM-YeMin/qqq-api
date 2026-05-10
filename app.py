@@ -21,7 +21,14 @@ app = FastAPI()
 async def startup_event():
     print("Server started — using enhanced keyword sentiment (lightweight)")
 
-TICKERS = ['QQQ', 'NVDA', 'SPY', 'GLD', 'SLV', 'AMD', 'TSM', 'MSFT', 'AAPL', 'GOOGL']
+TICKERS = [
+    'QQQ', 'NVDA', 'SPY', 'GLD', 'SLV',
+    'AMD', 'TSM', 'MSFT', 'AAPL', 'GOOGL',
+    'JPM', 'V', 'BRK-B',
+    'XOM', 'CVX', 'NEE',
+    'UNH', 'JNJ', 'NVO',
+    'CAT', 'AMZN', 'RTX',
+]
 _signal_cache = {}  # in-memory cache for expensive calls
 
 # ============================================================
@@ -37,16 +44,24 @@ CACHE_HOURS = 24
 # Known earnings dates — updated automatically by get_earnings_date()
 # Fallback when all APIs fail
 KNOWN_EARNINGS = {
-    'NVDA':  ['2026-05-20', '2026-08-27', '2026-11-19', '2027-02-25'],
-    'QQQ':   [],
-    'SPY':   [],
-    'GLD':   [],
-    'SLV':   [],
+    'NVDA':  ['2026-05-20', '2026-08-27', '2026-11-19'],
     'AMD':   ['2026-07-29', '2026-10-28', '2027-01-28'],
     'TSM':   ['2026-07-17', '2026-10-16', '2027-01-15'],
     'MSFT':  ['2026-07-29', '2026-10-28', '2027-01-28'],
     'AAPL':  ['2026-08-05', '2026-10-28', '2027-01-28'],
     'GOOGL': ['2026-07-29', '2026-10-28', '2027-01-28'],
+    'JPM':   ['2026-07-15', '2026-10-14', '2027-01-14'],
+    'V':     ['2026-07-23', '2026-10-22', '2027-01-28'],
+    'XOM':   ['2026-08-05', '2026-10-28', '2027-01-30'],
+    'CVX':   ['2026-08-05', '2026-10-28', '2027-01-30'],
+    'NEE':   ['2026-07-22', '2026-10-21', '2027-01-28'],
+    'UNH':   ['2026-07-15', '2026-10-14', '2027-01-14'],
+    'JNJ':   ['2026-07-15', '2026-10-14', '2027-01-14'],
+    'NVO':   ['2026-08-12', '2026-11-05', '2027-02-11'],
+    'CAT':   ['2026-07-28', '2026-10-27', '2027-01-27'],
+    'AMZN':  ['2026-08-05', '2026-10-28', '2027-01-28'],
+    'RTX':   ['2026-07-22', '2026-10-21', '2027-01-21'],
+    'QQQ': [], 'SPY': [], 'GLD': [], 'SLV': [], 'BRK-B': [],
 }
 
 def get_earnings_date(ticker: str) -> dict:
@@ -161,16 +176,28 @@ MACRO_KEYWORDS = {
 }
 
 TICKER_KEYWORDS = {
-    'NVDA':  ['nvidia','nvda','gpu','ai chip','cuda','blackwell','h100','data center'],
-    'QQQ':   ['nasdaq','tech stocks','qqq','faang','big tech','rates','treasury'],
-    'SPY':   ['s&p','spy','market rally','correction','dow','broad market'],
-    'GLD':   ['gold','inflation','dollar','safe haven','fed','gld'],
-    'SLV':   ['silver','slv','industrial metals','solar','ev'],
-    'AMD':   ['amd','advanced micro','ryzen','radeon','epyc','mi300','mi400'],
-    'TSM':   ['tsmc','taiwan semi','taiwan semiconductor','foundry','chip making'],
-    'MSFT':  ['microsoft','msft','azure','copilot','openai','windows','office'],
-    'AAPL':  ['apple','aapl','iphone','mac','app store','vision pro','tim cook'],
-    'GOOGL': ['google','alphabet','googl','gemini','search','youtube','waymo','cloud'],
+    'NVDA':  ['nvidia','nvda','gpu','ai chip','blackwell','h100','data center'],
+    'QQQ':   ['nasdaq','tech stocks','qqq','big tech','rates'],
+    'SPY':   ['s&p','spy','market rally','correction','broad market'],
+    'GLD':   ['gold','inflation','dollar','safe haven','fed'],
+    'SLV':   ['silver','industrial metals','solar','ev'],
+    'AMD':   ['amd','advanced micro','ryzen','radeon','epyc'],
+    'TSM':   ['tsmc','taiwan semi','foundry','chip making'],
+    'MSFT':  ['microsoft','msft','azure','copilot','openai'],
+    'AAPL':  ['apple','aapl','iphone','mac','app store'],
+    'GOOGL': ['google','alphabet','googl','gemini','search','youtube'],
+    'JPM':   ['jpmorgan','jpm','chase','banking','federal reserve','interest rates'],
+    'V':     ['visa','payments','consumer spending','credit card'],
+    'BRK-B': ['berkshire','buffett','brk','value investing'],
+    'XOM':   ['exxon','xom','oil','crude','energy','petroleum'],
+    'CVX':   ['chevron','cvx','oil','gas','energy'],
+    'NEE':   ['nextera','nee','renewable','solar','wind','utility'],
+    'UNH':   ['unitedhealth','unh','insurance','healthcare','medicare'],
+    'JNJ':   ['johnson','jnj','pharma','medical device','healthcare'],
+    'NVO':   ['novo nordisk','nvo','ozempic','wegovy','glp-1','obesity'],
+    'CAT':   ['caterpillar','cat','infrastructure','construction','mining'],
+    'AMZN':  ['amazon','amzn','aws','prime','ecommerce','cloud'],
+    'RTX':   ['raytheon','rtx','defense','aerospace','military','missile'],
 }
 
 def score_headline(headline: str, ticker: str = None) -> float:
@@ -337,6 +364,12 @@ def get_features(ticker: str) -> dict:
     above_sma50    = 1 if price > sma50_val  else 0
     pct_from_sma20 = (price / sma20_val - 1) * 100
 
+    # PSAR calculation
+    try:
+        psar_data = compute_psar(df['High'].squeeze(), df['Low'].squeeze(), c)
+    except:
+        psar_data = {'psar': None, 'psar_bullish': None}
+
     return {
         'price':          price,
         'prev_close':     prev_close,
@@ -360,6 +393,8 @@ def get_features(ticker: str) -> dict:
         'above_sma50':    above_sma50,
         'pct_from_sma20': float(pct_from_sma20),
         'gap_pct':        round((price / prev_close - 1) * 100, 2) if prev_close > 0 else 0.0,
+        'psar':           psar_data.get('psar'),
+        'psar_bullish':   psar_data.get('psar_bullish'),
         'gap_down':       (price / prev_close - 1) * 100 < -2.0 if prev_close > 0 else False,
         'gap_up':         (price / prev_close - 1) * 100 > 2.0  if prev_close > 0 else False,
     }
@@ -510,6 +545,13 @@ def generate_signal(features: dict) -> dict:
     # ATR adjustment — high volatility = lower confidence
     if atr_pct > 3.0:
         confidence *= 0.90  # very volatile — reduce confidence
+
+    # PSAR confirmation — adds extra signal quality
+    psar_bull = features.get('psar_bullish') if features else None
+    if psar_bull is False and signal == 'BUY':
+        confidence *= 0.85   # PSAR says downtrend
+    elif psar_bull is True and signal == 'BUY':
+        confidence = min(confidence * 1.05, 0.95)  # PSAR confirms uptrend
 
     # FIX 2: Reduce confidence first/last 30min (volatile periods)
     try:
@@ -955,6 +997,118 @@ def calculate_sharpe(ticker: str, days: int = 90) -> dict:
         return {'sharpe': None, 'sortino': None, 'calmar': None,
                 'annualized_return': None, 'volatility': None, 'error': str(e)}
 
+
+# ============================================================
+# PSAR — Parabolic SAR indicator
+# Returns: above/below price = trend direction
+# ============================================================
+def compute_psar(high: pd.Series, low: pd.Series, close: pd.Series,
+                 af_start: float = 0.02, af_step: float = 0.02, af_max: float = 0.2) -> dict:
+    """Calculate Parabolic SAR. Returns current value and trend direction."""
+    try:
+        n = len(close)
+        if n < 10:
+            return {'psar': None, 'psar_bullish': None}
+
+        psar   = [0.0] * n
+        bull   = True
+        af     = af_start
+        ep     = float(low.iloc[0])
+        hp     = float(high.iloc[0])
+        lp     = float(low.iloc[0])
+        psar[0] = float(high.iloc[0])
+
+        for i in range(2, n):
+            if bull:
+                psar[i] = psar[i-1] + af * (hp - psar[i-1])
+                psar[i] = min(psar[i], float(low.iloc[i-1]), float(low.iloc[i-2]))
+                if float(low.iloc[i]) < psar[i]:
+                    bull   = False
+                    psar[i] = hp
+                    lp     = float(low.iloc[i])
+                    af     = af_start
+                    ep     = lp
+                else:
+                    if float(high.iloc[i]) > hp:
+                        hp = float(high.iloc[i])
+                        af = min(af + af_step, af_max)
+                    ep = hp
+            else:
+                psar[i] = psar[i-1] + af * (lp - psar[i-1])
+                psar[i] = max(psar[i], float(high.iloc[i-1]), float(high.iloc[i-2]))
+                if float(high.iloc[i]) > psar[i]:
+                    bull   = True
+                    psar[i] = lp
+                    hp     = float(high.iloc[i])
+                    af     = af_start
+                    ep     = hp
+                else:
+                    if float(low.iloc[i]) < lp:
+                        lp = float(low.iloc[i])
+                        af = min(af + af_step, af_max)
+                    ep = lp
+
+        current_psar  = round(psar[-1], 2)
+        current_price = float(close.iloc[-1])
+        psar_bullish  = current_price > current_psar  # price above PSAR = bullish
+
+        return {
+            'psar':         current_psar,
+            'psar_bullish': psar_bullish,
+        }
+    except Exception as e:
+        print(f"PSAR error: {e}")
+        return {'psar': None, 'psar_bullish': None}
+
+# ============================================================
+# RELATIVE STRENGTH vs SPY
+# Measures how ticker performs vs S&P 500 over 5 days
+# RS > 1.0 = outperforming market = strong stock
+# ============================================================
+_rs_cache     = {}
+_rs_cache_time = {}
+
+def get_relative_strength(ticker: str) -> dict:
+    """Calculate relative strength vs SPY over 5 days."""
+    try:
+        now = datetime.utcnow()
+        cache_key = f'rs_{ticker}'
+        if cache_key in _rs_cache:
+            age = (now - _rs_cache_time[cache_key]).total_seconds() / 3600
+            if age < 1:  # 1 hour cache
+                return _rs_cache[cache_key]
+
+        # Download both ticker and SPY
+        tdf = yf.download(ticker, period='15d', interval='1d', progress=False)
+        sdf = yf.download('SPY',  period='15d', interval='1d', progress=False)
+
+        if tdf.empty or sdf.empty or len(tdf) < 6 or len(sdf) < 6:
+            return {'rs': 1.0, 'rs_5d': 0.0, 'spy_5d': 0.0, 'outperforming': None}
+
+        tc = tdf['Close'].squeeze()
+        sc = sdf['Close'].squeeze()
+
+        # 5-day performance
+        t5d = float((tc.iloc[-1] / tc.iloc[-6] - 1) * 100)
+        s5d = float((sc.iloc[-1] / sc.iloc[-6] - 1) * 100)
+
+        # Relative strength ratio
+        rs = round(t5d - s5d, 2)  # positive = outperforming SPY
+
+        result = {
+            'rs':            round(rs, 2),
+            'rs_5d':         round(t5d, 2),   # ticker 5-day return
+            'spy_5d':        round(s5d, 2),   # SPY 5-day return
+            'outperforming': rs > 0,           # True if beating market
+        }
+        _rs_cache[cache_key]      = result
+        _rs_cache_time[cache_key] = now
+        return result
+
+    except Exception as e:
+        print(f"RS error {ticker}: {e}")
+        return {'rs': 0.0, 'rs_5d': 0.0, 'spy_5d': 0.0, 'outperforming': None}
+
 @app.get('/signals')
 def get_signals():
     vix     = get_vix()
@@ -1092,11 +1246,25 @@ def get_signals():
             ticker_data['confidence'] = min(ticker_data['confidence'] * 1.10, 0.95)
             ticker_data['breakout']   = True
 
+        # BUILD 2: Relative strength vs SPY
+        rs_data = get_relative_strength(ticker) if ticker != 'SPY' else {'rs': 0, 'rs_5d': 0, 'spy_5d': 0, 'outperforming': None}
+
+        # RS boost — outperforming SPY = stronger entry
+        if rs_data.get('outperforming') is True and ticker_data['signal'] == 'BUY':
+            ticker_data['confidence'] = min(ticker_data['confidence'] * 1.08, 0.95)
+        elif rs_data.get('outperforming') is False and ticker_data['signal'] == 'BUY':
+            ticker_data['confidence'] *= 0.88  # lagging market — reduce confidence
+
+        # Add PSAR to response
+        ticker_data['psar']    = features.get('psar') if features else None
+        ticker_data['psar_bullish'] = features.get('psar_bullish') if features else None
+
         # Add all data to response
         ticker_data['finbert']         = finbert_data
         ticker_data['vwap']            = vwap_data
         ticker_data['earnings_mom']    = earn_mom
         ticker_data['breakout_signal'] = breakout
+        ticker_data['rs']              = rs_data
 
         result[ticker] = ticker_data
 
