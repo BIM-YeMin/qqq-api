@@ -1109,6 +1109,134 @@ def get_relative_strength(ticker: str) -> dict:
         print(f"RS error {ticker}: {e}")
         return {'rs': 0.0, 'rs_5d': 0.0, 'spy_5d': 0.0, 'outperforming': None}
 
+
+# ============================================================
+# ADAPTIVE STRATEGY ENGINE
+# Detects market regime and adjusts strategy automatically
+# BULL_LOW_VOL / BULL_MID_VOL  → momentum (buy breakouts)
+# SIDEWAYS                     → mean reversion (buy dips)
+# BEAR_MID_VOL                 → defensive (reduce size)
+# HIGH_FEAR                    → cash + defensive only
+# BREAKOUT                     → aggressive momentum
+# ============================================================
+
+def get_mean_reversion_signal(features: dict) -> dict:
+    """
+    Mean reversion strategy — used in SIDEWAYS regime.
+    Buy when price is oversold relative to recent range.
+    Opposite of momentum — buy weakness, sell strength.
+    """
+    if not features:
+        return {'signal': 'HOLD', 'confidence': 0.5, 'strategy': 'mean_reversion'}
+
+    rsi      = features.get('rsi', 50)
+    bb_pct   = features.get('bb_pct', 0.5)
+    price    = features.get('price', 0)
+    sma20    = features.get('sma20', price)
+    vol_ratio = features.get('vol_ratio', 1.0)
+
+    score = 0.0
+
+    # RSI oversold = buy opportunity in mean reversion
+    if   rsi < 30: score += 0.8   # very oversold — strong buy
+    elif rsi < 40: score += 0.4   # oversold — buy
+    elif rsi > 70: score -= 0.6   # overbought — sell
+    elif rsi > 60: score -= 0.3   # approaching overbought
+
+    # Bollinger Band — below lower band = buy
+    if   bb_pct < 0.1: score += 0.6   # at lower band
+    elif bb_pct < 0.25: score += 0.3
+    elif bb_pct > 0.9: score -= 0.6   # at upper band — sell
+    elif bb_pct > 0.75: score -= 0.3
+
+    # Distance from SMA20 — far below = buy
+    if sma20 > 0:
+        pct_from_sma = (price - sma20) / sma20 * 100
+        if   pct_from_sma < -5: score += 0.4   # very far below — bounce likely
+        elif pct_from_sma < -2: score += 0.2
+        elif pct_from_sma > 5:  score -= 0.4   # very far above — pullback likely
+        elif pct_from_sma > 2:  score -= 0.2
+
+    final_score = max(-1.0, min(1.0, score))
+
+    if final_score > 0.3:
+        signal     = 'BUY'
+        confidence = min(0.60 + final_score * 0.35, 0.90)
+    elif final_score < -0.3:
+        signal     = 'SELL'
+        confidence = min(0.60 + abs(final_score) * 0.35, 0.90)
+    else:
+        signal     = 'HOLD'
+        confidence = 0.5
+
+    return {
+        'signal':     signal,
+        'confidence': round(confidence, 3),
+        'score':      round(final_score, 3),
+        'strategy':   'mean_reversion',
+    }
+
+def get_defensive_signal(features: dict) -> dict:
+    """
+    Defensive strategy — used in BEAR/HIGH_FEAR regime.
+    Only buy defensive stocks (utilities, healthcare, gold).
+    Reduce position sizes significantly.
+    """
+    if not features:
+        return {'signal': 'HOLD', 'confidence': 0.5, 'strategy': 'defensive'}
+
+    rsi = features.get('rsi', 50)
+
+    # In defensive mode — very conservative
+    # Only buy on extreme oversold
+    if rsi < 25:
+        return {'signal': 'BUY', 'confidence': 0.65, 'score': 0.3, 'strategy': 'defensive'}
+    elif rsi > 65:
+        return {'signal': 'SELL', 'confidence': 0.70, 'score': -0.3, 'strategy': 'defensive'}
+    else:
+        return {'signal': 'HOLD', 'confidence': 0.5, 'score': 0.0, 'strategy': 'defensive'}
+
+def get_adaptive_signal(features: dict, regime: str, ticker: str) -> dict:
+    """
+    Master adaptive signal — selects strategy based on regime.
+    Returns signal with strategy metadata for transparency.
+    """
+    # Defensive tickers — always use these in bear market
+    DEFENSIVE_TICKERS = ['GLD', 'SLV', 'NEE', 'UNH', 'JNJ', 'V', 'JPM']
+
+    if regime in ['HIGH_FEAR', 'BEAR_MID_VOL']:
+        if ticker in DEFENSIVE_TICKERS:
+            sig = get_mean_reversion_signal(features)  # buy dips on defensives
+        else:
+            sig = get_defensive_signal(features)        # very conservative on others
+        sig['size_mult'] = 0.4   # 40% normal size in fear
+        sig['regime_strategy'] = 'defensive'
+
+    elif regime == 'SIDEWAYS':
+        sig = get_mean_reversion_signal(features)
+        sig['size_mult'] = 0.7   # 70% size in sideways
+        sig['regime_strategy'] = 'mean_reversion'
+
+    elif regime in ['BULL_LOW_VOL', 'BULL_MID_VOL']:
+        sig = generate_signal(features)  # standard momentum
+        sig['size_mult'] = 1.0
+        sig['regime_strategy'] = 'momentum'
+
+    elif regime == 'BREAKOUT':
+        sig = generate_signal(features)  # momentum
+        # Boost confidence in breakout regime
+        if sig['signal'] == 'BUY':
+            sig['confidence'] = min(sig['confidence'] * 1.15, 0.95)
+        sig['size_mult'] = 1.5   # 150% size in breakout
+        sig['regime_strategy'] = 'aggressive_momentum'
+
+    else:
+        sig = generate_signal(features)
+        sig['size_mult'] = 1.0
+        sig['regime_strategy'] = 'momentum'
+
+    return sig
+
 @app.get('/signals')
 def get_signals():
     vix     = get_vix()
@@ -1265,6 +1393,8 @@ def get_signals():
         ticker_data['earnings_mom']    = earn_mom
         ticker_data['breakout_signal'] = breakout
         ticker_data['rs']              = rs_data
+        ticker_data['regime_strategy'] = sig.get('regime_strategy', 'momentum')
+        ticker_data['size_mult']       = sig.get('size_mult', 1.0)
 
         result[ticker] = ticker_data
 
@@ -1577,6 +1707,36 @@ def walkforward(ticker: str, windows: int = 6):
         })
     except Exception as e:
         return JSONResponse({'error': str(e), 'ticker': ticker})
+
+@app.get('/regime_strategy')
+def regime_strategy_endpoint():
+    """Current regime and which strategy is active."""
+    import yfinance as yf2
+    try:
+        vix_data = yf2.download('^VIX', period='5d', interval='1d', progress=False)
+        vix = float(vix_data['Close'].iloc[-1]) if not vix_data.empty else 18.0
+    except:
+        vix = 18.0
+    regime = 'SIDEWAYS'
+    if vix < 15:   regime = 'BULL_LOW_VOL'
+    elif vix < 20: regime = 'BULL_MID_VOL'
+    elif vix < 25: regime = 'SIDEWAYS'
+    elif vix >= 30: regime = 'HIGH_FEAR'
+    else:           regime = 'BEAR_MID_VOL'
+    strategy_map = {
+        'BULL_LOW_VOL':  'momentum',
+        'BULL_MID_VOL':  'momentum',
+        'SIDEWAYS':      'mean_reversion',
+        'BEAR_MID_VOL':  'defensive',
+        'HIGH_FEAR':     'defensive',
+        'BREAKOUT':      'aggressive_momentum',
+    }
+    return JSONResponse({
+        'vix':      round(vix, 1),
+        'regime':   regime,
+        'strategy': strategy_map.get(regime, 'momentum'),
+        'size_mult': 0.4 if regime in ['HIGH_FEAR','BEAR_MID_VOL'] else 0.7 if regime == 'SIDEWAYS' else 1.0,
+    })
 
 @app.get('/health')
 def health():
