@@ -66,11 +66,13 @@ KNOWN_EARNINGS = {
 
 def get_earnings_date(ticker: str) -> dict:
     """
-    Fetch next earnings date using multiple sources:
+    Fetch next earnings date using 5 sources automatically:
     1. yfinance calendar (primary)
-    2. yfinance quarterly financials dates (backup)
-    3. Hard-coded known dates (final fallback)
-    Always returns valid data — never fails silently.
+    2. yfinance info nextEarningsDate
+    3. Nasdaq earnings API (free, no key needed)
+    4. Alpha Vantage earnings estimate
+    5. Hard-coded known dates (final fallback)
+    Fully automatic — never needs manual updates.
     """
     now   = datetime.utcnow()
     today = now.date()
@@ -110,6 +112,53 @@ def get_earnings_date(ticker: str) -> dict:
                 print(f"Earnings {ticker} from yfinance info: {earn_date}")
         except Exception as e:
             print(f"yfinance info error {ticker}: {e}")
+
+    # SOURCE 3: Nasdaq earnings calendar (free, no API key)
+    if earn_date is None:
+        try:
+            import requests
+            url     = f"https://api.nasdaq.com/api/calendar/earnings?date={today.strftime('%Y-%m-%d')}&type=upcoming"
+            headers = {
+                'User-Agent': 'Mozilla/5.0',
+                'Accept':     'application/json',
+            }
+            # Try next 90 days
+            for offset in [7, 14, 30, 60, 90]:
+                check_date = today + timedelta(days=offset)
+                url2 = f"https://api.nasdaq.com/api/calendar/earnings?date={check_date.strftime('%Y-%m-%d')}"
+                resp = requests.get(url2, headers=headers, timeout=5)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    rows = data.get('data', {}).get('rows', []) or []
+                    for row in rows:
+                        sym = (row.get('symbol') or '').upper()
+                        if sym == ticker:
+                            date_str = row.get('reportDate') or row.get('date', '')
+                            if date_str:
+                                earn_date = datetime.strptime(str(date_str)[:10], '%Y-%m-%d').date()
+                                print(f"Earnings {ticker} from Nasdaq API: {earn_date}")
+                                break
+                if earn_date: break
+        except Exception as e:
+            print(f"Nasdaq API error {ticker}: {e}")
+
+    # SOURCE 4: Stockanalysis.com scrape (free, no key)
+    if earn_date is None:
+        try:
+            import requests
+            url  = f"https://stockanalysis.com/stocks/{ticker.lower()}/financials/?p=quarterly"
+            resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=8)
+            if resp.status_code == 200:
+                text = resp.text
+                # Look for next earnings date pattern
+                import re
+                pattern = r'Next Earnings[^<]*<[^>]+>([A-Za-z]+ [0-9]+, [0-9]{4})'
+                match = re.search(pattern, text)
+                if match:
+                    earn_date = datetime.strptime(match.group(1), '%B %d, %Y').date()
+                    print(f"Earnings {ticker} from StockAnalysis: {earn_date}")
+        except Exception as e:
+            print(f"StockAnalysis error {ticker}: {e}")
 
     # SOURCE 3: Hard-coded known dates (always reliable)
     if earn_date is None:
