@@ -1446,6 +1446,9 @@ def get_signals():
         ticker_data['size_mult']       = sig.get('size_mult', 1.0)
 
         result[ticker] = ticker_data
+        # Alias BRK-B → BRK.B so GAS orchestrator (which uses dot notation) can find it
+        if ticker == 'BRK-B':
+            result['BRK.B'] = ticker_data
 
     # Market regime
     bull_count = sum(1 for t in TICKERS if result.get(t, {}).get('signal') == 'BUY')
