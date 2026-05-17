@@ -19,7 +19,8 @@ app = FastAPI()
 
 @app.on_event("startup")
 async def startup_event():
-    print("Server started — using enhanced keyword sentiment (lightweight)")
+    print("Server started — loading persisted models + enhanced sentiment")
+    _load_persisted_models()
 
 TICKERS = [
     'QQQ', 'NVDA', 'SPY', 'GLD', 'SLV',
@@ -30,6 +31,20 @@ TICKERS = [
     'CAT', 'AMZN', 'RTX',
 ]
 _signal_cache = {}  # in-memory cache for expensive calls
+_model_cache  = {}  # per-ticker trained XGBoost models (loaded from disk on startup)
+
+def _load_persisted_models():
+    """Load any models saved from previous Railway runs."""
+    import os, pickle, glob
+    for path in glob.glob('/tmp/model_*.pkl'):
+        try:
+            with open(path, 'rb') as f:
+                saved = pickle.load(f)
+            ticker = saved.get('ticker', 'ALL')
+            _model_cache[ticker] = saved['model']
+            print(f"Loaded model for {ticker} (val_acc={saved.get('val_acc','?')})")
+        except Exception as e:
+            print(f"Model load failed {path}: {e}")
 
 # ============================================================
 # LIVE EARNINGS CALENDAR — auto-fetched via yfinance
@@ -648,6 +663,163 @@ def get_iv_rank() -> float:
         return 30.0
 
 # ============================================================
+# FIX F: PER-TICKER IV PERCENTILE
+# Uses yfinance options chain to get ATM implied volatility
+# Compares vs 30-day historical volatility (HV30)
+# iv_percentile <30 = buy options (cheap premium)
+# iv_percentile >50 = sell premium (expensive)
+# Cached 2 hours to avoid rate limits
+# ============================================================
+_iv_cache = {}
+
+def get_ticker_iv_percentile(ticker: str) -> dict:
+    """Get per-ticker IV percentile vs 30-day HV. Cached 2h."""
+    now = datetime.utcnow()
+    cached = _iv_cache.get(ticker)
+    if cached and (now - cached['time']).seconds < 7200:
+        return cached['data']
+
+    try:
+        stock = yf.Ticker(ticker)
+
+        # Get ATM implied volatility from nearest expiry options chain
+        exps = stock.options
+        if not exps:
+            return {'iv_pct': 50, 'atm_iv': 0.3, 'hv30': 0.25, 'iv_vs_hv': 1.0, 'regime': 'NORMAL'}
+
+        # Use nearest expiry with at least 7 days
+        today = datetime.utcnow().date()
+        valid_exps = [e for e in exps if (datetime.strptime(e, '%Y-%m-%d').date() - today).days >= 7]
+        exp = valid_exps[0] if valid_exps else exps[0]
+
+        chain = stock.option_chain(exp)
+        hist  = yf.download(ticker, period='60d', interval='1d', progress=False)
+        if hist.empty or len(hist) < 30:
+            return {'iv_pct': 50, 'atm_iv': 0.3, 'hv30': 0.25, 'iv_vs_hv': 1.0, 'regime': 'NORMAL'}
+
+        price = float(hist['Close'].iloc[-1])
+
+        # Find ATM strike (closest to current price)
+        calls = chain.calls
+        if calls.empty:
+            return {'iv_pct': 50, 'atm_iv': 0.3, 'hv30': 0.25, 'iv_vs_hv': 1.0, 'regime': 'NORMAL'}
+
+        calls = calls[calls['impliedVolatility'] > 0]
+        atm_idx = (calls['strike'] - price).abs().idxmin()
+        atm_iv  = float(calls.loc[atm_idx, 'impliedVolatility'])
+
+        # 30-day historical volatility
+        log_ret = np.log(hist['Close'] / hist['Close'].shift(1)).dropna()
+        hv30    = float(log_ret.tail(30).std() * np.sqrt(252))
+
+        # IV vs HV ratio
+        iv_vs_hv = round(atm_iv / hv30, 2) if hv30 > 0 else 1.0
+
+        # Simple IV percentile: compare ATM IV vs last 252d of HV
+        # (proxy — real IV percentile needs 252d of IV history)
+        hv_252 = float(log_ret.std() * np.sqrt(252))
+        iv_pct = round(min(atm_iv / (hv_252 + 1e-9) * 50, 100), 1)  # scaled 0-100
+
+        # Regime classification
+        if   iv_pct < 25:  regime = 'CHEAP'    # buy options
+        elif iv_pct < 45:  regime = 'NORMAL'
+        elif iv_pct < 65:  regime = 'ELEVATED'  # neutral
+        else:              regime = 'EXPENSIVE'  # sell premium
+
+        result = {
+            'iv_pct':    iv_pct,
+            'atm_iv':    round(atm_iv * 100, 1),   # as % e.g. 28.5
+            'hv30':      round(hv30 * 100, 1),
+            'iv_vs_hv':  iv_vs_hv,
+            'regime':    regime,
+            'buy_signal':  iv_pct < 30,    # cheap — buy options
+            'sell_signal': iv_pct > 50,    # expensive — sell premium
+        }
+        _iv_cache[ticker] = {'data': result, 'time': now}
+        return result
+
+    except Exception as e:
+        print(f"IV percentile error {ticker}: {e}")
+        return {'iv_pct': 50, 'atm_iv': 30.0, 'hv30': 25.0, 'iv_vs_hv': 1.0, 'regime': 'NORMAL', 'buy_signal': False, 'sell_signal': False}
+
+# ============================================================
+# FIX G: RSI DIVERGENCE DETECTION
+# Bearish divergence: price making higher highs, RSI lower highs
+#   → trend exhaustion, reduces BUY confidence
+# Bullish divergence: price making lower lows, RSI higher lows
+#   → potential reversal, boosts BUY confidence
+# Uses last 20 bars, looks for 2+ swing points
+# ============================================================
+def detect_rsi_divergence(close_series, rsi_series, lookback: int = 20) -> dict:
+    """Detect bullish/bearish RSI divergence over last N bars."""
+    try:
+        c   = close_series.tail(lookback).values
+        rsi = rsi_series.tail(lookback).values
+        if len(c) < 10:
+            return {'bullish': False, 'bearish': False, 'strength': 0}
+
+        # Find local highs and lows (simple: compare to neighbours)
+        def local_highs(arr):
+            return [i for i in range(1, len(arr)-1) if arr[i] > arr[i-1] and arr[i] > arr[i+1]]
+        def local_lows(arr):
+            return [i for i in range(1, len(arr)-1) if arr[i] < arr[i-1] and arr[i] < arr[i+1]]
+
+        price_highs = local_highs(c)
+        price_lows  = local_lows(c)
+
+        bearish_div = False
+        bullish_div = False
+        strength    = 0
+
+        # Bearish: last 2 price highs → price higher, RSI lower
+        if len(price_highs) >= 2:
+            i1, i2 = price_highs[-2], price_highs[-1]
+            if c[i2] > c[i1] and rsi[i2] < rsi[i1] - 3:  # 3pt RSI gap min
+                bearish_div = True
+                strength    = round((c[i2]/c[i1] - 1) * 100, 2)  # price % higher
+
+        # Bullish: last 2 price lows → price lower, RSI higher
+        if len(price_lows) >= 2:
+            i1, i2 = price_lows[-2], price_lows[-1]
+            if c[i2] < c[i1] and rsi[i2] > rsi[i1] + 3:  # 3pt RSI gap min
+                bullish_div = True
+                strength    = round((1 - c[i2]/c[i1]) * 100, 2)  # price % lower
+
+        return {'bullish': bullish_div, 'bearish': bearish_div, 'strength': abs(strength)}
+
+    except Exception as e:
+        return {'bullish': False, 'bearish': False, 'strength': 0}
+
+# ============================================================
+# FIX H: BOLLINGER BAND SQUEEZE DETECTION
+# Squeeze = BB width at 20-day low → low vol before breakout
+# squeeze_pct: how compressed vs recent history (0=no squeeze, 100=max squeeze)
+# ============================================================
+def detect_bb_squeeze(close_series, lookback: int = 20) -> dict:
+    """Detect Bollinger Band squeeze — low vol before potential breakout."""
+    try:
+        c    = close_series
+        mean = c.rolling(20).mean()
+        std  = c.rolling(20).std()
+        bb_width = ((mean + 2*std) - (mean - 2*std)) / mean  # normalised width
+
+        current_width = float(bb_width.iloc[-1])
+        min_width_20  = float(bb_width.tail(lookback).min())
+        max_width_20  = float(bb_width.tail(lookback).max())
+
+        width_range = max_width_20 - min_width_20
+        squeeze_pct = round((1 - (current_width - min_width_20) / (width_range + 1e-9)) * 100, 1)
+
+        is_squeezing = squeeze_pct > 70  # top 30% compression = squeeze
+        return {
+            'squeezing':   is_squeezing,
+            'squeeze_pct': squeeze_pct,
+            'bb_width':    round(current_width * 100, 2),
+        }
+    except:
+        return {'squeezing': False, 'squeeze_pct': 0, 'bb_width': 5.0}
+
+# ============================================================
 # API ROUTES
 # ============================================================
 
@@ -790,16 +962,6 @@ def finbert_score(texts: list) -> float:
 
 BULLISH_WORDS = ['beat','surge','strong','rally','upgrade','bullish','record','growth','positive','profit']
 BEARISH_WORDS = ['miss','drop','fall','downgrade','sell','bearish','loss','decline','weak','concern','tariff']
-
-def keyword_sentiment(headlines, ticker):
-    score = 0.0
-    for h in headlines:
-        h = h.lower()
-        for w in BULLISH_WORDS:
-            if w in h: score += 0.2
-        for w in BEARISH_WORDS:
-            if w in h: score -= 0.2
-    return round(max(-1.0, min(1.0, score / max(len(headlines), 1))), 3)
 
 def get_finbert_sentiment(ticker: str) -> dict:
     """Get FinBERT-powered sentiment for a ticker."""
@@ -1445,6 +1607,50 @@ def get_signals():
         ticker_data['regime_strategy'] = sig.get('regime_strategy', 'momentum')
         ticker_data['size_mult']       = sig.get('size_mult', 1.0)
 
+        # FIX F: Per-ticker IV percentile (cached 2h)
+        iv_key = f'iv_{ticker}'
+        iv_data = _signal_cache.get(iv_key, {}).get('data')
+        if iv_data is None or (datetime.utcnow() - _signal_cache.get(iv_key, {}).get('time', datetime.min)).seconds > 7200:
+            try: iv_data = get_ticker_iv_percentile(ticker)
+            except: iv_data = {'iv_pct': 50, 'regime': 'NORMAL', 'buy_signal': False, 'sell_signal': False}
+            _signal_cache[iv_key] = {'data': iv_data, 'time': datetime.utcnow()}
+        ticker_data['iv_percentile'] = iv_data
+
+        # FIX G: RSI divergence — modify confidence based on divergence
+        try:
+            hist_div = yf.download(ticker, period='60d', interval='1d', progress=False)
+            if not hist_div.empty and len(hist_div) >= 20:
+                c_div   = hist_div['Close'].squeeze()
+                rsi_div = pd.Series([compute_rsi(c_div.iloc[:i+1], 14) for i in range(14, len(c_div))],
+                                     index=c_div.index[14:])
+                div = detect_rsi_divergence(c_div, rsi_div)
+            else:
+                div = {'bullish': False, 'bearish': False, 'strength': 0}
+        except:
+            div = {'bullish': False, 'bearish': False, 'strength': 0}
+
+        ticker_data['rsi_divergence'] = div
+        # Apply divergence to confidence
+        if div['bearish'] and ticker_data['signal'] == 'BUY':
+            ticker_data['confidence'] = round(ticker_data['confidence'] * 0.80, 3)
+            ticker_data['divergence_warning'] = 'BEARISH_DIV'
+        elif div['bullish'] and ticker_data['signal'] in ['HOLD', 'SELL']:
+            ticker_data['confidence'] = min(round(ticker_data['confidence'] * 1.10, 3), 0.95)
+            ticker_data['divergence_warning'] = 'BULLISH_DIV'
+        else:
+            ticker_data['divergence_warning'] = None
+
+        # FIX H: BB squeeze detection
+        try:
+            squeeze = detect_bb_squeeze(c_div if not hist_div.empty else pd.Series([]))
+        except:
+            squeeze = {'squeezing': False, 'squeeze_pct': 0}
+        ticker_data['bb_squeeze'] = squeeze
+        # Boost confidence on breakout signal + squeeze combo
+        if squeeze['squeezing'] and ticker_data.get('breakout_signal', {}).get('near_breakout'):
+            ticker_data['confidence'] = min(round(ticker_data['confidence'] * 1.08, 3), 0.95)
+            ticker_data['squeeze_breakout'] = True
+
         result[ticker] = ticker_data
         # Alias BRK-B → BRK.B so GAS orchestrator (which uses dot notation) can find it
         if ticker == 'BRK-B':
@@ -1515,19 +1721,64 @@ def macro_endpoint():
 
 @app.post('/retrain')
 def retrain_endpoint(data: dict):
-    ticker   = data.get('ticker', 'NVDA')
+    """
+    Retrain XGBoost model on real WIN/LOSS outcomes.
+    Saves model to disk so it persists between Railway restarts.
+    Uses walk-forward validation to prevent overfitting.
+    Min 5 samples (reduced from 10 for new tickers).
+    """
+    import os, pickle
+    ticker   = data.get('ticker', 'ALL')
     outcomes = data.get('outcomes', [])
-    if len(outcomes) < 10:
-        return JSONResponse({'status': 'insufficient_data', 'count': len(outcomes)})
+
+    if len(outcomes) < 5:
+        return JSONResponse({'status': 'insufficient_data', 'count': len(outcomes), 'need': 5})
+
     try:
-        keys = ['rsi','macd','roc5','roc10','roc20','bb_pct','vol_ratio','above_sma20','above_sma50','atr_pct']
-        X = [[float(o.get('features',{}).get(k,0)) for k in keys] for o in outcomes]
-        y = [1 if o.get('result')=='WIN' else 0 for o in outcomes]
-        model = xgb.XGBClassifier(n_estimators=100, max_depth=4, learning_rate=0.1, eval_metric='logloss', use_label_encoder=False)
-        model.fit(X, y)
+        keys = ['rsi','macd','roc5','roc10','roc20','bb_pct','vol_ratio',
+                'above_sma20','above_sma50','atr_pct','psar_bullish','rs']
+        X = []
+        y = []
+        for o in outcomes:
+            feat = o.get('features', {})
+            row  = [float(feat.get(k, 0) or 0) for k in keys]
+            X.append(row)
+            y.append(1 if o.get('result') == 'WIN' else 0)
+
+        # Walk-forward validation: train on first 80%, validate on last 20%
+        split = max(1, int(len(X) * 0.8))
+        X_train, X_val = X[:split], X[split:]
+        y_train, y_val = y[:split], y[split:]
+
+        model = xgb.XGBClassifier(
+            n_estimators=100, max_depth=4, learning_rate=0.1,
+            eval_metric='logloss', use_label_encoder=False,
+            subsample=0.8, colsample_bytree=0.8  # prevent overfitting
+        )
+        model.fit(X_train, y_train)
+
         from sklearn.metrics import accuracy_score
-        acc = accuracy_score(y, model.predict(X))
-        return JSONResponse({'status': 'success', 'ticker': ticker, 'accuracy': round(acc,3), 'samples': len(outcomes)})
+        train_acc = accuracy_score(y_train, model.predict(X_train))
+        val_acc   = accuracy_score(y_val,   model.predict(X_val)) if X_val else train_acc
+
+        # Save model to disk so it persists between restarts
+        model_path = f'/tmp/model_{ticker}.pkl'
+        with open(model_path, 'wb') as f:
+            pickle.dump({'model': model, 'keys': keys, 'ticker': ticker,
+                         'train_acc': train_acc, 'val_acc': val_acc,
+                         'trained_at': datetime.utcnow().isoformat()}, f)
+
+        # Store in memory cache too
+        _model_cache[ticker] = model
+
+        return JSONResponse({
+            'status':    'success',
+            'ticker':    ticker,
+            'samples':   len(outcomes),
+            'train_acc': round(train_acc, 3),
+            'val_acc':   round(val_acc, 3),
+            'overfit':   train_acc - val_acc > 0.15,  # flag if overfitting
+        })
     except Exception as e:
         return JSONResponse({'status': 'error', 'message': str(e)})
 
@@ -1790,8 +2041,51 @@ def regime_strategy_endpoint():
         'size_mult': 0.4 if regime in ['HIGH_FEAR','BEAR_MID_VOL'] else 0.7 if regime == 'SIDEWAYS' else 1.0,
     })
 
+@app.get('/iv')
+def iv_endpoint():
+    """Per-ticker IV percentile for all tickers. Used by Telegram /options command."""
+    result = {}
+    for ticker in TICKERS:
+        try:
+            result[ticker] = get_ticker_iv_percentile(ticker)
+        except:
+            result[ticker] = {'iv_pct': 50, 'regime': 'NORMAL'}
+    # Alias BRK-B
+    if 'BRK-B' in result:
+        result['BRK.B'] = result['BRK-B']
+    return JSONResponse(result)
+
 @app.get('/health')
 def health():
-    return {'status': 'ok', 'time': datetime.utcnow().isoformat()}
+    return {
+        'status':        'ok',
+        'time':          datetime.utcnow().isoformat(),
+        'tickers':       len(TICKERS),
+        'models_loaded': list(_model_cache.keys()),
+        'cache_keys':    len(_signal_cache),
+    }
+
+@app.get('/models')
+def models_status():
+    """Show status of all trained XGBoost models."""
+    import os, pickle, glob
+    result = {}
+    for ticker, model in _model_cache.items():
+        result[ticker] = {'loaded': True, 'type': type(model).__name__}
+    # Also check disk
+    for path in glob.glob('/tmp/model_*.pkl'):
+        try:
+            with open(path, 'rb') as f:
+                saved = pickle.load(f)
+            t = saved.get('ticker', 'unknown')
+            result[t] = {
+                'loaded':     t in _model_cache,
+                'train_acc':  saved.get('train_acc'),
+                'val_acc':    saved.get('val_acc'),
+                'trained_at': saved.get('trained_at'),
+                'samples':    saved.get('samples', '?'),
+            }
+        except: pass
+    return JSONResponse(result if result else {'status': 'no models trained yet'})
 
 # Run: uvicorn server:app --host 0.0.0.0 --port 8000
