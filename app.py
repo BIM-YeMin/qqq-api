@@ -544,50 +544,53 @@ def generate_signal(features: dict) -> dict:
     # ============================================================
     volume_confirmed = vol_ratio >= 0.8  # at least 80% of average volume
 
-    # 1. Trend alignment (weight: 0.25)
-    trend   = (features.get('above_sma20', 0) + features.get('above_sma50', 0)) / 2
-    score   += trend * 0.25
-    weights += 0.25
+    # Get regime-specific weights (research: momentum higher in trending, BB higher in sideways)
+    regime_now = features.get('regime', 'BULL_MID_VOL')
+    rw = get_regime_weights(regime_now)
 
-    # 2. Momentum ROC (weight: 0.20)
+    # 1. Trend alignment
+    trend   = (features.get('above_sma20', 0) + features.get('above_sma50', 0)) / 2
+    score   += trend * rw['trend']
+    weights += rw['trend']
+
+    # 2. Momentum ROC
     roc_avg   = (features.get('roc5',0)*0.5 + features.get('roc10',0)*0.3 + features.get('roc20',0)*0.2)
     mom_score = float(np.clip(roc_avg / 8, -1, 1))
-    score     += mom_score * 0.20
-    weights   += 0.20
+    score     += mom_score * rw['momentum']
+    weights   += rw['momentum']
 
-    # 3. RSI — refined zones (weight: 0.20)
+    # 3. RSI — refined zones
     if   rsi > 70: rsi_score = -0.5   # overbought warning
     elif rsi > 60: rsi_score =  0.4   # bullish momentum
     elif rsi > 50: rsi_score =  0.2   # mild bullish
     elif rsi > 40: rsi_score = -0.2   # mild bearish
     elif rsi > 30: rsi_score = -0.4   # bearish
     else:          rsi_score =  0.6   # oversold bounce
-    score   += rsi_score * 0.20
-    weights += 0.20
+    score   += rsi_score * rw['rsi']
+    weights += rw['rsi']
 
-    # 4. MACD (weight: 0.15)
+    # 4. MACD
     macd       = features.get('macd', 0)
     macd_sig   = features.get('macd_signal', 0)
     macd_score = 1.0 if macd > macd_sig else -1.0
-    # Extra weight if MACD crossing (strong signal)
     if abs(macd - macd_sig) < 0.1 and macd > macd_sig:
         macd_score = 1.5  # fresh crossover
-    score   += macd_score * 0.15
-    weights += 0.15
+    score   += macd_score * rw['macd']
+    weights += rw['macd']
 
-    # 5. Bollinger Band (weight: 0.10)
+    # 5. Bollinger Band
     if   bb > 0.95: bb_score = -0.9  # at upper band — overextended
     elif bb > 0.75: bb_score = -0.3
     elif bb > 0.5:  bb_score =  0.1
     elif bb > 0.25: bb_score =  0.3
     else:           bb_score =  0.8  # at lower band — oversold
-    score   += bb_score * 0.10
-    weights += 0.10
+    score   += bb_score * rw['bb']
+    weights += rw['bb']
 
-    # 6. Volume confirmation (weight: 0.10)
+    # 6. Volume confirmation
     vol_score = 0.5 if volume_confirmed else -0.3
-    score     += vol_score * 0.10
-    weights   += 0.10
+    score     += vol_score * rw['vol']
+    weights   += rw['vol']
 
     # Normalize
     final_score = score / weights if weights > 0 else 0.0
@@ -1129,6 +1132,20 @@ def get_breakout_signal(ticker: str, features: dict) -> dict:
 # ============================================================
 def get_regime_weights(regime: str) -> dict:
     """
+    Regime-conditional indicator weights for generate_signal().
+    Research: momentum indicators 2x higher weight in trending markets,
+    mean reversion indicators dominate in sideways markets.
+    """
+    weights = {
+        'BULL_LOW_VOL':  {'trend': 0.30, 'momentum': 0.35, 'rsi': 0.10, 'macd': 0.10, 'bb': 0.05, 'vol': 0.10},
+        'BULL_MID_VOL':  {'trend': 0.25, 'momentum': 0.30, 'rsi': 0.15, 'macd': 0.15, 'bb': 0.05, 'vol': 0.10},
+        'SIDEWAYS':      {'trend': 0.10, 'momentum': 0.10, 'rsi': 0.25, 'macd': 0.10, 'bb': 0.30, 'vol': 0.15},
+        'BEAR_MID_VOL':  {'trend': 0.20, 'momentum': 0.15, 'rsi': 0.20, 'macd': 0.20, 'bb': 0.15, 'vol': 0.10},
+        'HIGH_FEAR':     {'trend': 0.15, 'momentum': 0.10, 'rsi': 0.25, 'macd': 0.15, 'bb': 0.20, 'vol': 0.15},
+        'BREAKOUT':      {'trend': 0.20, 'momentum': 0.40, 'rsi': 0.10, 'macd': 0.10, 'bb': 0.10, 'vol': 0.10},
+    }
+    return weights.get(regime, weights['BULL_MID_VOL'])
+    """
     Return signal weights and position size multiplier per regime.
     Based on: strong-trend 1.5x momentum, sideways 1.2x mean-reversion,
     breakout 2.5x size, high-vol 0.7x size.
@@ -1424,21 +1441,23 @@ def get_adaptive_signal(features: dict, regime: str, ticker: str) -> dict:
         sig['regime_strategy'] = 'defensive'
 
     elif regime == 'SIDEWAYS':
+        features['regime'] = regime  # pass regime for weighted scoring
         sig = get_mean_reversion_signal(features)
-        sig['size_mult'] = 0.7   # 70% size in sideways
+        sig['size_mult'] = 0.7
         sig['regime_strategy'] = 'mean_reversion'
 
     elif regime in ['BULL_LOW_VOL', 'BULL_MID_VOL']:
-        sig = generate_signal(features)  # standard momentum
+        features['regime'] = regime
+        sig = generate_signal(features)
         sig['size_mult'] = 1.0
         sig['regime_strategy'] = 'momentum'
 
     elif regime == 'BREAKOUT':
-        sig = generate_signal(features)  # momentum
-        # Boost confidence in breakout regime
+        features['regime'] = regime
+        sig = generate_signal(features)
         if sig['signal'] == 'BUY':
             sig['confidence'] = min(sig['confidence'] * 1.15, 0.95)
-        sig['size_mult'] = 1.5   # 150% size in breakout
+        sig['size_mult'] = 1.5
         sig['regime_strategy'] = 'aggressive_momentum'
 
     else:
@@ -1771,13 +1790,35 @@ def retrain_endpoint(data: dict):
         # Store in memory cache too
         _model_cache[ticker] = model
 
+        # SHAP feature importance — identify which features drive predictions
+        shap_importance = {}
+        try:
+            import shap as shap_lib
+            explainer  = shap_lib.TreeExplainer(model)
+            shap_vals  = explainer.shap_values(X_train)
+            mean_shap  = [float(abs(shap_vals[:, i]).mean()) for i in range(len(keys))]
+            total_shap = sum(mean_shap) or 1
+            shap_importance = {keys[i]: round(mean_shap[i] / total_shap * 100, 1) for i in range(len(keys))}
+            # Sort by importance
+            shap_importance = dict(sorted(shap_importance.items(), key=lambda x: -x[1]))
+            print(f"SHAP top features for {ticker}: {list(shap_importance.items())[:5]}")
+            # Update model file with SHAP data
+            with open(model_path, 'rb') as f:
+                saved = pickle.load(f)
+            saved['shap_importance'] = shap_importance
+            with open(model_path, 'wb') as f:
+                pickle.dump(saved, f)
+        except Exception as se:
+            print(f"SHAP skipped ({se}) — install shap in requirements.txt for feature importance")
+
         return JSONResponse({
-            'status':    'success',
-            'ticker':    ticker,
-            'samples':   len(outcomes),
-            'train_acc': round(train_acc, 3),
-            'val_acc':   round(val_acc, 3),
-            'overfit':   train_acc - val_acc > 0.15,  # flag if overfitting
+            'status':           'success',
+            'ticker':           ticker,
+            'samples':          len(outcomes),
+            'train_acc':        round(train_acc, 3),
+            'val_acc':          round(val_acc, 3),
+            'overfit':          train_acc - val_acc > 0.15,
+            'shap_top_features': list(shap_importance.items())[:5] if shap_importance else [],
         })
     except Exception as e:
         return JSONResponse({'status': 'error', 'message': str(e)})
@@ -2079,11 +2120,12 @@ def models_status():
                 saved = pickle.load(f)
             t = saved.get('ticker', 'unknown')
             result[t] = {
-                'loaded':     t in _model_cache,
-                'train_acc':  saved.get('train_acc'),
-                'val_acc':    saved.get('val_acc'),
-                'trained_at': saved.get('trained_at'),
-                'samples':    saved.get('samples', '?'),
+                'loaded':          t in _model_cache,
+                'train_acc':       saved.get('train_acc'),
+                'val_acc':         saved.get('val_acc'),
+                'trained_at':      saved.get('trained_at'),
+                'samples':         saved.get('samples', '?'),
+                'shap_top_features': saved.get('shap_importance', {}),
             }
         except: pass
     return JSONResponse(result if result else {'status': 'no models trained yet'})
